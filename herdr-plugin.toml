@@ -1,0 +1,27 @@
+id = "martinv.pr-tracker"
+name = "Claude PR Tracker"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Tracks the GitHub PR each Claude Code session produces, with state + actions, in its own herdr window."
+platforms = ["linux", "macos"]
+
+# The PR board: a tab pane that polls agent sessions, scrapes PR URLs, and shows gh state.
+[[panes]]
+id = "pr-board"
+title = "PRs"
+placement = "tab"
+command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/scripts/board.sh\""]
+
+# Bind to a key via config.toml:  [[keys.command]] type="plugin_action", command="martinv.pr-tracker:open-board"
+[[actions]]
+id = "open-board"
+title = "Open PR board"
+description = "Open/focus the Claude PR tracker window"
+contexts = ["global"]
+command = ["herdr", "plugin", "pane", "open", "martinv.pr-tracker", "pr-board"]
+
+# Optional: nudge a refresh marker when herdr detects a new agent session.
+# ponytail: the board polls anyway; this just makes it react faster. Harmless if it no-ops.
+[[events]]
+on = "pane.agent_detected"
+command = ["sh", "-c", "touch \"${HERDR_PLUGIN_STATE_DIR:-/tmp}/refresh\" 2>/dev/null || true"]
