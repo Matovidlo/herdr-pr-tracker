@@ -20,7 +20,7 @@ herdr plugin link /path/to/herdr-pr-tracker
 
 ## Open the board
 ```sh
-herdr plugin pane open martinv.pr-tracker pr-board
+herdr plugin pane open --plugin martinv.pr-tracker --entrypoint pr-board
 ```
 Or bind a key in `~/.config/herdr/config.toml`:
 ```toml
