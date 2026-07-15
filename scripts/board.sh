@@ -15,7 +15,7 @@ for bin in gh jq; do
 done
 
 # rows[] is filled each cycle: "pane_id<TAB>agent<TAB>status<TAB>branch<TAB>pr_url"
-declare -a ROW_URL
+declare -a ROW_URL ROW_CWD
 # pane_id -> PR url; scraping pane scrollback is the slowest step, do it once
 # per pane and only rediscover on explicit refresh ('r').
 declare -A URL_CACHE
@@ -75,7 +75,7 @@ render() {
   done <<<"$agents"
   wait
   # pass 1b: fold discoveries into the cache, build rows
-  local -a R_AGENT=() R_STATUS=() R_URL=()
+  local -a R_AGENT=() R_STATUS=() R_URL=() R_CWD=()
   local -A WANT=()
   local n=0
   for ((i=1; i<=m; i++)); do
@@ -86,29 +86,28 @@ render() {
       URL_CACHE[$pane]="${url:--}"
     fi
     if [ "$url" = "-" ] || [ -z "$url" ]; then hidden=$((hidden+1)); continue; fi
-    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; WANT["$url"]=1
+    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; WANT["$url"]=1
   done
 
   # pass 2: fetch all PR states in parallel, deduped — wall time = one gh call
-  local cache="$STATE_DIR/prcache" u
-  mkdir -p "$cache"
+  local u
   for u in "${!WANT[@]}"; do
     fetch_pr "$u" "$cache/${u//[:\/]/_}" &
   done
   wait
 
   # pass 3: assemble off-screen, then draw in one shot (no flicker)
-  ROW_URL=()
+  ROW_URL=(); ROW_CWD=()
   local line
   for ((idx=1; idx<=n; idx++)); do
-    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"
+    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"
     IFS=$'\t' read -r num title state checks < "$cache/${url//[:\/]/_}" 2>/dev/null || true
     printf -v line '  %-16.16s %-9s %3s  #%-8s %-7s %.40s\n' \
       "${R_AGENT[$idx]}" "${R_STATUS[$idx]}" "$idx" "${num:-?}" "${checks:--}" "${title:-}"
     out+="$line"
   done
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
-  [ "$hidden" -gt 0 ] && out+=$'\n'"  +$hidden session(s) without a PR (r to rediscover)"$'\n'
+  [ "$hidden" -gt 0 ] && out+=$'\n'"  $n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)"$'\n'
 
   clear
   printf '\033[1m  Claude PR Tracker\033[0m [%s]  (number+Enter open · r refresh · c checkout · m merge · p plan · w scope · q quit)\n' \
@@ -123,11 +122,13 @@ action_for() {
   # bash expands ${arr[$a]} before $a is assigned, which dies under set -u.
   local n="$1" verb="$2"
   local url="${ROW_URL[$n]:-}"
+  local cwd="${ROW_CWD[$n]:-}"
   [ -z "$url" ] && return
+  # checkout/merge must run in the session's repo, not the board's cwd
   case "$verb" in
     open)     gh pr view "$url" --web ;;
-    checkout) gh pr checkout "$url" ;;
-    merge)    gh pr merge "$url" ;;            # interactive; uses repo defaults
+    checkout) (cd "${cwd:-.}" && gh pr checkout "$url") ;;
+    merge)    (cd "${cwd:-.}" && gh pr merge "$url") ;;   # interactive; uses repo defaults
     plan)     local f="$PLANS_DIR/$(basename "$url").md"; ${EDITOR:-vi} "$f" ;;  # ponytail: pane stdout is a pipe, full-screen editors may warn; good enough
   esac
 }
