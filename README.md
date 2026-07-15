@@ -25,14 +25,19 @@ herdr plugin pane open --plugin martinv.pr-tracker --entrypoint pr-board
 Or bind a key in `~/.config/herdr/config.toml`:
 ```toml
 [[keys.command]]
-key = "prefix+shift+r"
+key = "prefix+t"            # pick any chord that doesn't collide with your bindings
 type = "plugin_action"
-command = "martinv.pr-tracker:open-board"
+command = "martinv.pr-tracker.open-board"   # dot-notation: <plugin_id>.<action_id>
+description = "open PR tracker board"
 ```
 
 ## Board keys
-`r` refresh · `1`–`9` open that row's PR in browser · `c` then digit = checkout ·
-`m` then digit = merge · `p` then digit = open/edit that PR's plan note · `q` quit.
+Type a row number + `Enter` to open that PR in the browser · `c`/`m`/`p` then
+number + `Enter` = checkout / merge / edit plan note · `r` full refresh ·
+`w` toggle current-workspace-only ⇄ all sessions · `q` quit.
+
+Sessions from the board's own workspace sort first; sessions with no PR are
+hidden behind a `+N session(s) without a PR` footer.
 
 Plan notes live under `$HERDR_PLUGIN_STATE_DIR/plans/` — one markdown file per PR,
 so each change keeps its own plan separate from the PR state.

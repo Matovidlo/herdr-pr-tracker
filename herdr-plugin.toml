@@ -12,7 +12,7 @@ title = "PRs"
 placement = "tab"
 command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/scripts/board.sh\""]
 
-# Bind to a key via config.toml:  [[keys.command]] type="plugin_action", command="martinv.pr-tracker:open-board"
+# Bind to a key via config.toml:  [[keys.command]] type="plugin_action", command="martinv.pr-tracker.open-board"
 [[actions]]
 id = "open-board"
 title = "Open PR board"
