@@ -108,7 +108,7 @@ render() {
     out+="$line"
   done
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
-  [ "$hidden" -gt 0 ] && out+=$'\n'"  +$hidden session(s) without a PR (r to rediscover)"$'\n'
+  [ "$hidden" -gt 0 ] && out+=$'\n'"  $n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)"$'\n'
 
   clear
   printf '\033[1m  Claude PR Tracker\033[0m [%s]  (number+Enter open · r refresh · c checkout · m merge · p plan · w scope · q quit)\n' \
