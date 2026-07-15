@@ -16,6 +16,9 @@ done
 
 # rows[] is filled each cycle: "pane_id<TAB>agent<TAB>status<TAB>branch<TAB>pr_url"
 declare -a ROW_URL
+# pane_id -> PR url; scraping pane scrollback is the slowest step, do it once
+# per pane and only rediscover on explicit refresh ('r').
+declare -A URL_CACHE
 
 # Find the PR url for one agent: first scrape recent pane text, then fall back to
 # `gh pr list --head <branch>` using the pane's working directory.
@@ -25,75 +28,139 @@ find_pr() {
         | grep -oiE "$PR_URL_RE" | tail -1)"
   if [ -z "$url" ] && [ -n "$cwd" ] && [ -d "$cwd" ]; then
     branch="$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null)"
-    [ -n "$branch" ] && url="$(gh pr list --head "$branch" --json url --jq '.[0].url // empty' 2>/dev/null)"
+    # gh resolves the repo from $PWD — must run in the pane's cwd, not ours
+    [ -n "$branch" ] && url="$(cd "$cwd" && gh pr list --head "$branch" --json url --jq '.[0].url // empty' 2>/dev/null)"
   fi
   printf '%s' "$url"
 }
 
+SCOPE="all"   # all | ws ('w' toggles); PR rows get numbers 1-9, others are just listed
+
+# fetch one PR's display fields into a cache file (used in parallel)
+fetch_pr() {
+  local url="$1" out="$2"
+  gh pr view "$url" --json number,title,state,reviewDecision,statusCheckRollup 2>/dev/null \
+  | jq -r '[(.number // "?"), (.title // ""),
+            ((.state // "?") + (if .reviewDecision then " "+.reviewDecision else "" end)),
+            ([.statusCheckRollup[]?.conclusion // .statusCheckRollup[]?.state] | map(select(.!=null))
+             | if length==0 then "-"
+               elif any(.=="FAILURE" or .=="ERROR" or .=="TIMED_OUT") then "FAIL"
+               elif any(.=="PENDING" or .=="IN_PROGRESS" or .=="QUEUED") then "..."
+               else "ok" end)] | @tsv' > "$out" 2>/dev/null
+}
+
 render() {
-  clear
-  printf '\033[1m  Claude PR Tracker\033[0m   (r refresh · 1-9 open in browser · c checkout · m merge · p plan · q quit)\n'
-  printf '  %-18s %-9s %-9s %-7s %s\n' "AGENT" "STATUS" "PR" "CHECKS" "TITLE"
-  printf '  %s\n' "------------------------------------------------------------------------------"
-  ROW_URL=()
-  local agents idx=0
-  agents="$("$HERDR" agent list 2>/dev/null | jq -c '.result.agents[]?' 2>/dev/null)"
-  if [ -z "$agents" ]; then
-    printf '  (no active agent sessions)\n'
-    return
-  fi
-  while IFS= read -r a; do
-    [ -z "$a" ] && continue
-    local pane agent status cwd url pr_json num title state checks branch
-    pane="$(jq -r '.pane_id' <<<"$a")"
-    agent="$(jq -r '.agent // .display_agent // "agent"' <<<"$a")"
-    status="$(jq -r '.agent_status' <<<"$a" | tr 'A-Z' 'a-z')"
-    cwd="$(jq -r '.foreground_cwd // .cwd // ""' <<<"$a")"
-    url="$(find_pr "$pane" "$cwd")"
-    if [ -n "$url" ]; then
-      pr_json="$(gh pr view "$url" --json number,title,state,reviewDecision,statusCheckRollup 2>/dev/null)"
-      num="$(jq -r '.number // "?"' <<<"$pr_json")"
-      title="$(jq -r '.title // ""' <<<"$pr_json")"
-      state="$(jq -r '(.state // "?") + (if .reviewDecision then " "+.reviewDecision else "" end)' <<<"$pr_json")"
-      # checks: pass/fail/pending rollup
-      checks="$(jq -r '[.statusCheckRollup[]?.conclusion // .statusCheckRollup[]?.state] | map(select(.!=null))
-                       | if length==0 then "-"
-                         elif any(.=="FAILURE" or .=="ERROR" or .=="TIMED_OUT") then "FAIL"
-                         elif any(.=="PENDING" or .=="IN_PROGRESS" or .=="QUEUED") then "..."
-                         else "ok" end' <<<"$pr_json")"
-      idx=$((idx+1)); ROW_URL[$idx]="$url"
-      printf '  %-18.18s %-9s #%-8s %-7s %.40s\n' "$idx) $agent" "$status" "$num" "$checks" "$title"
-    else
-      branch="$( [ -d "$cwd" ] && git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true )"
-      printf '  %-18.18s %-9s %-9s %-7s %s\n' "$agent" "$status" "(no PR)" "-" "${branch:-$cwd}"
-    fi
+  local idx=0 hidden=0 agents pane agent status cwd url num title state checks out=""
+  # One jq pass over all agents; current workspace's sessions sort first,
+  # optionally narrowed to this board's workspace only ('w').
+  local ws=""
+  [ "$SCOPE" = ws ] && ws="${HERDR_WORKSPACE_ID:-}"
+  agents="$("$HERDR" agent list 2>/dev/null | jq -r --arg ws "$ws" --arg cur "${HERDR_WORKSPACE_ID:-}" '
+    [.result.agents[]? | select($ws == "" or .workspace_id == $ws)]
+    | sort_by(.workspace_id != $cur)[]
+    | [.pane_id, (.agent // .display_agent // "agent"),
+       ((.agent_status // "?") | ascii_downcase),
+       (.foreground_cwd // .cwd // "")] | @tsv' 2>/dev/null)"
+
+  local cache="$STATE_DIR/prcache"
+  mkdir -p "$cache"
+
+  # pass 1a: discover uncached panes' PR urls in parallel
+  local -a A_PANE=() A_AGENT=() A_STATUS=() A_CWD=()
+  local m=0 i
+  while IFS=$'\t' read -r pane agent status cwd; do
+    [ -z "$pane" ] && continue
+    m=$((m+1)); A_PANE[$m]="$pane"; A_AGENT[$m]="$agent"; A_STATUS[$m]="$status"; A_CWD[$m]="$cwd"
+    [ -z "${URL_CACHE[$pane]:-}" ] && find_pr "$pane" "$cwd" > "$cache/url_${pane//:/_}" &
   done <<<"$agents"
+  wait
+  # pass 1b: fold discoveries into the cache, build rows
+  local -a R_AGENT=() R_STATUS=() R_URL=()
+  local -A WANT=()
+  local n=0
+  for ((i=1; i<=m; i++)); do
+    pane="${A_PANE[$i]}"
+    url="${URL_CACHE[$pane]:-}"
+    if [ -z "$url" ]; then
+      url="$(cat "$cache/url_${pane//:/_}" 2>/dev/null)"
+      URL_CACHE[$pane]="${url:--}"
+    fi
+    if [ "$url" = "-" ] || [ -z "$url" ]; then hidden=$((hidden+1)); continue; fi
+    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; WANT["$url"]=1
+  done
+
+  # pass 2: fetch all PR states in parallel, deduped — wall time = one gh call
+  local cache="$STATE_DIR/prcache" u
+  mkdir -p "$cache"
+  for u in "${!WANT[@]}"; do
+    fetch_pr "$u" "$cache/${u//[:\/]/_}" &
+  done
+  wait
+
+  # pass 3: assemble off-screen, then draw in one shot (no flicker)
+  ROW_URL=()
+  local line
+  for ((idx=1; idx<=n; idx++)); do
+    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"
+    IFS=$'\t' read -r num title state checks < "$cache/${url//[:\/]/_}" 2>/dev/null || true
+    printf -v line '  %-16.16s %-9s %3s  #%-8s %-7s %.40s\n' \
+      "${R_AGENT[$idx]}" "${R_STATUS[$idx]}" "$idx" "${num:-?}" "${checks:--}" "${title:-}"
+    out+="$line"
+  done
+  [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
+  [ "$hidden" -gt 0 ] && out+=$'\n'"  +$hidden session(s) without a PR (r to rediscover)"$'\n'
+
+  clear
+  printf '\033[1m  Claude PR Tracker\033[0m [%s]  (number+Enter open · r refresh · c checkout · m merge · p plan · w scope · q quit)\n' \
+    "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )"
+  printf '  %-16s %-9s %3s  %-9s %-7s %s\n' "AGENT" "STATUS" "N" "PR" "CHECKS" "TITLE"
+  printf '  %s\n' "------------------------------------------------------------------------------"
+  printf '%s' "$out"
 }
 
 action_for() {
-  local n="$1" verb="$2" url="${ROW_URL[$n]:-}"
+  # NB: keep the array lookup on its own line — in `local a=$1 b=${arr[$a]}`
+  # bash expands ${arr[$a]} before $a is assigned, which dies under set -u.
+  local n="$1" verb="$2"
+  local url="${ROW_URL[$n]:-}"
   [ -z "$url" ] && return
   case "$verb" in
     open)     gh pr view "$url" --web ;;
     checkout) gh pr checkout "$url" ;;
     merge)    gh pr merge "$url" ;;            # interactive; uses repo defaults
-    plan)     local f="$PLANS_DIR/$(basename "$url").md"; ${EDITOR:-vi} "$f" </dev/tty >/dev/tty 2>&1 ;;
+    plan)     local f="$PLANS_DIR/$(basename "$url").md"; ${EDITOR:-vi} "$f" ;;  # ponytail: pane stdout is a pipe, full-screen editors may warn; good enough
   esac
 }
 
 PENDING_VERB="open"
+NUMBUF=""
 while :; do
   render
-  # refresh every 10s, or act on a keypress
-  if IFS= read -rsn1 -t 10 key </dev/tty; then
+  # Inner key loop: verb/digit keys don't pay for a re-render; only timeout,
+  # 'r', 'w', or a completed action falls through to render again.
+  # herdr forwards keystrokes to the pane's stdin, not /dev/tty — read fd0.
+  while IFS= read -rsn1 -t 10 key; do
     case "$key" in
       q) clear; exit 0 ;;
-      r) : ;;
-      c) PENDING_VERB="checkout" ;;
-      m) PENDING_VERB="merge" ;;
-      p) PENDING_VERB="plan" ;;
-      [1-9]) action_for "$key" "$PENDING_VERB"; PENDING_VERB="open" ;;
-      *) : ;;
+      r) URL_CACHE=(); NUMBUF=""; break ;;
+      w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; NUMBUF=""; break ;;
+      c) PENDING_VERB="checkout"; NUMBUF=""; printf '\r  [checkout] type row number + Enter … ' ;;
+      m) PENDING_VERB="merge";    NUMBUF=""; printf '\r  [merge] type row number + Enter … '    ;;
+      p) PENDING_VERB="plan";     NUMBUF=""; printf '\r  [plan] type row number + Enter … '     ;;
+      [0-9]) NUMBUF+="$key"; printf '\r  %s row: %s (Enter to run) ' "$PENDING_VERB" "$NUMBUF" ;;
+      ''|$'\n'|$'\r')   # Enter — read -n1 yields '' for newline
+        [ -z "$NUMBUF" ] && continue
+        n="$NUMBUF"; NUMBUF=""
+        if [ -z "${ROW_URL[$n]:-}" ]; then
+          printf '\r  no PR on row %s (rows: 1-%s)          ' "$n" "${#ROW_URL[@]}"
+          PENDING_VERB="open"
+        else
+          printf '\r  %s row %s … ' "$PENDING_VERB" "$n"
+          action_for "$n" "$PENDING_VERB"
+          printf 'done \n'
+          PENDING_VERB="open"; break
+        fi ;;
+      *) NUMBUF="" ;;
     esac
-  fi
+  done
 done
