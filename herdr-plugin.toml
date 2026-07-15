@@ -18,7 +18,7 @@ id = "open-board"
 title = "Open PR board"
 description = "Open/focus the Claude PR tracker window"
 contexts = ["global"]
-command = ["herdr", "plugin", "pane", "open", "martinv.pr-tracker", "pr-board"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "martinv.pr-tracker", "--entrypoint", "pr-board"]
 
 # Optional: nudge a refresh marker when herdr detects a new agent session.
 # ponytail: the board polls anyway; this just makes it react faster. Harmless if it no-ops.
