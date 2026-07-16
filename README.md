@@ -72,6 +72,23 @@ skills execute with that session's context, visibly in its pane. Sessions with
 status `working` are skipped (a half-typed prompt would corrupt their turn);
 retry when idle.
 
+### Triage
+`t` inspects every row's indicators and suggests one batch: conflicts/behind →
+`r` (your rebase verb), review comments waiting on you or failing CI → `ar`,
+green + approved → `m`, no review yet → `pr`. Skill verbs are only suggested
+when defined in `commands.conf`. Press `Enter` to run the suggested batch,
+any other key to cancel (or type your own with `:`).
+
+For a daily routine, run it headless from cron:
+
+```cron
+0 9 * * 1-5  bash <plugin_root>/scripts/board.sh --triage             # print + herdr notification
+0 9 * * 1-5  bash <plugin_root>/scripts/board.sh --triage --execute   # also run the suggested batch
+```
+
+`--execute` runs the batch unattended (busy sessions are still skipped), so
+enable it only once you trust your verbs — `m` merges PRs.
+
 Sessions from the board's own workspace sort first; sessions with no PR are
 hidden behind a `+N session(s) without a PR` footer.
 
