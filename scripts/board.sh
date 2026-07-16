@@ -154,7 +154,7 @@ render() {
   [ "$hidden" -gt 0 ] && out+=$'\n'"  ${C_DIM}$n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)${C_RST}"$'\n'
 
   clear
-  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
@@ -179,6 +179,41 @@ action_for() {
   esac
 }
 
+# resolve a short verb token to an action_for verb; empty = open
+resolve_verb() {
+  case "$1" in
+    ''|o) echo open ;;
+    c)    echo checkout ;;
+    m)    echo merge ;;
+    p)    echo plan ;;
+    *)    return 1 ;;
+  esac
+}
+
+# batch line: comma/space-separated "<row><verb>" tokens, e.g. "1,2c,3m".
+# Plain numbers open in the browser, so "1,2" opens two tabs.
+run_batch() {
+  local tok n verb
+  local -a toks
+  IFS=', ' read -ra toks <<<"$1"
+  for tok in "${toks[@]}"; do
+    [ -z "$tok" ] && continue
+    if [[ "$tok" =~ ^([0-9]+)([a-z]*)$ ]]; then
+      n="${BASH_REMATCH[1]}"
+      if ! verb="$(resolve_verb "${BASH_REMATCH[2]}")"; then
+        printf '  %s: unknown verb "%s"\n' "$tok" "${BASH_REMATCH[2]}"; continue
+      fi
+      if [ -z "${ROW_URL[$n]:-}" ]; then
+        printf '  %s: no PR on row %s (rows: 1-%s)\n' "$tok" "$n" "${#ROW_URL[@]}"; continue
+      fi
+      printf '  %s → %s row %s\n' "$tok" "$verb" "$n"
+      action_for "$n" "$verb"
+    else
+      printf '  skipping unrecognized token: %s\n' "$tok"
+    fi
+  done
+}
+
 PENDING_VERB="open"
 NUMBUF=""
 while :; do
@@ -194,6 +229,15 @@ while :; do
       c) PENDING_VERB="checkout"; NUMBUF=""; printf '\r  [checkout] type row number + Enter … ' ;;
       m) PENDING_VERB="merge";    NUMBUF=""; printf '\r  [merge] type row number + Enter … '    ;;
       p) PENDING_VERB="plan";     NUMBUF=""; printf '\r  [plan] type row number + Enter … '     ;;
+      :)  # command line: "1,2c,3m" + Enter runs each token in order
+        printf '\r  cmd> '
+        IFS= read -r cmdline || cmdline=""
+        printf '\n'
+        [ -n "$cmdline" ] && run_batch "$cmdline"
+        NUMBUF=""; PENDING_VERB="open"
+        printf '  (any key to refresh) '
+        IFS= read -rsn1 -t 30 _ || true
+        break ;;
       [0-9]) NUMBUF+="$key"; printf '\r  %s row: %s (Enter to run) ' "$PENDING_VERB" "$NUMBUF" ;;
       ''|$'\n'|$'\r')   # Enter — read -n1 yields '' for newline
         [ -z "$NUMBUF" ] && continue
