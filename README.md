@@ -58,12 +58,19 @@ is created on first run). One `verb = command template` per line; placeholders
 session working directory:
 
 ```conf
-pr = claude -p "/prreview {url}"
+pr = @/prreview {url}
+ar = @/pr-comment-response {url}
 r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
 ```
 
 Then `:1pr,2r` reviews PR 1 with your skill and rebases PR 2. Built-in verbs
 win over config; `r` re-reads the file.
+
+Templates starting with **`@`** are not run locally — the text after `@` is
+typed **into the claude session that owns the PR** (via `herdr pane run`), so
+skills execute with that session's context, visibly in its pane. Sessions with
+status `working` are skipped (a half-typed prompt would corrupt their turn);
+retry when idle.
 
 Sessions from the board's own workspace sort first; sessions with no PR are
 hidden behind a `+N session(s) without a PR` footer.
