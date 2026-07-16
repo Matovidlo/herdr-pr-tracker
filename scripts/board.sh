@@ -15,7 +15,7 @@ for bin in gh jq; do
 done
 
 # rows[] is filled each cycle: "pane_id<TAB>agent<TAB>status<TAB>branch<TAB>pr_url"
-declare -a ROW_URL ROW_CWD
+declare -a ROW_URL ROW_CWD ROW_PANE ROW_STATUS
 # pane_id -> PR url; scraping pane scrollback is the slowest step, do it once
 # per pane and only rediscover on explicit refresh ('r').
 declare -A URL_CACHE
@@ -114,7 +114,7 @@ render() {
   done <<<"$agents"
   wait
   # pass 1b: fold discoveries into the cache, build rows
-  local -a R_AGENT=() R_STATUS=() R_URL=() R_CWD=()
+  local -a R_AGENT=() R_STATUS=() R_URL=() R_CWD=() R_PANE=()
   local -A WANT=()
   local n=0
   for ((i=1; i<=m; i++)); do
@@ -125,7 +125,7 @@ render() {
       URL_CACHE[$pane]="${url:--}"
     fi
     if [ "$url" = "-" ] || [ -z "$url" ]; then hidden=$((hidden+1)); continue; fi
-    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; WANT["$url"]=1
+    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; R_PANE[$n]="$pane"; WANT["$url"]=1
   done
 
   # pass 2: fetch all PR states in parallel, deduped — wall time = one gh call
@@ -136,10 +136,10 @@ render() {
   wait
 
   # pass 3: assemble off-screen, then draw in one shot (no flicker)
-  ROW_URL=(); ROW_CWD=()
+  ROW_URL=(); ROW_CWD=(); ROW_PANE=(); ROW_STATUS=()
   local line
   for ((idx=1; idx<=n; idx++)); do
-    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"
+    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"
     local mrg rev cmts
     IFS=$'\t' read -r num title checks mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
     printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %s%s%s %s%s%s %s%s%s %3s  %.32s\n' \
@@ -182,7 +182,20 @@ action_for() {
       tmpl="${tmpl//\{url\}/$url}"
       tmpl="${tmpl//\{num\}/${url##*/}}"
       tmpl="${tmpl//\{cwd\}/$cwd}"
-      (cd "${cwd:-.}" && bash -c "$tmpl") ;;
+      if [[ "$tmpl" == @* ]]; then
+        # '@' templates are typed INTO the PR's own claude session (visible in
+        # its pane, uses its context) instead of running here.
+        local pane="${ROW_PANE[$n]:-}" sts="${ROW_STATUS[$n]:-}"
+        [ -z "$pane" ] && { printf '  row %s: no pane to send to\n' "$n"; return; }
+        if [ "$sts" = working ]; then
+          printf '  row %s: session is busy (working) — skipped, retry when idle\n' "$n"; return
+        fi
+        "$HERDR" pane run "$pane" "${tmpl#@}" >/dev/null 2>&1 \
+          && printf '  row %s: sent to session %s\n' "$n" "$pane" \
+          || printf '  row %s: failed to send to %s\n' "$n" "$pane"
+      else
+        (cd "${cwd:-.}" && bash -c "$tmpl")
+      fi ;;
   esac
 }
 
@@ -203,8 +216,11 @@ load_cmds() {
 [ -f "$CMDS_FILE" ] || cat > "$CMDS_FILE" <<'EOF'
 # herdr-pr-tracker custom verbs, used from the ':' command line, e.g. ":1pr,2r".
 # <verb> = <command template>; runs in the PR's session cwd.
+# Prefix the template with '@' to type it into the PR's own claude session
+# instead (skipped while that session is working).
 # Placeholders: {url} {num} {cwd}
-# pr = claude -p "/prreview {url}"
+# pr = @/prreview {url}
+# ar = @/pr-comment-response {url}
 # r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
 EOF
 load_cmds
