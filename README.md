@@ -5,7 +5,12 @@ session produces, in its own herdr window — with live `gh` state and a few act
 
 It polls `herdr agent list`, finds the PR for each session (scrapes the pane's
 recent output for a `…/pull/N` URL, falling back to `gh pr list --head <branch>`),
-and renders a board with PR number, state, review decision, and CI checks.
+and renders a board with per-PR indicators:
+
+- **CI** — `✓` passing / `✗` failing / `…` running / `-` none
+- **MERGE** — `✓` mergeable · `✗confl` conflicts (rebase needed) · `↓behind` behind base · `draft` · `merged`/`closed`
+- **REVIEW** — `←me` changes requested (waiting on you) · `→them` review requested (waiting on reviewers) · `✓` approved
+- **C** — comment count (issue comments + review comments)
 
 ## Requirements
 `herdr` ≥ 0.7.0, plus `gh` (authenticated) and `jq` on PATH.
