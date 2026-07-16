@@ -51,6 +51,20 @@ number + `Enter` = checkout / merge / edit plan note · `r` full refresh ·
 Verbs: *(none)*/`o` open · `c` checkout · `m` merge · `p` plan. Plain numbers
 open browser tabs, so `1,2` opens two PRs at once.
 
+### Custom verbs (your own skills/commands)
+Define extra verbs in `$HERDR_PLUGIN_STATE_DIR/commands.conf` (an example file
+is created on first run). One `verb = command template` per line; placeholders
+`{url}` `{num}` `{cwd}` are substituted and the command runs in that PR's
+session working directory:
+
+```conf
+pr = claude -p "/prreview {url}"
+r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
+```
+
+Then `:1pr,2r` reviews PR 1 with your skill and rebases PR 2. Built-in verbs
+win over config; `r` re-reads the file.
+
 Sessions from the board's own workspace sort first; sessions with no PR are
 hidden behind a `+N session(s) without a PR` footer.
 
