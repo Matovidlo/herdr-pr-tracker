@@ -255,23 +255,55 @@ action_for() {
   esac
 }
 
+# repos.conf: "owner/name = /path/to/local/clone" lines. When a PR's repo is
+# mapped, cc reuses that clone via `git worktree add` (instant, offline, your
+# working copy untouched) instead of a fresh network clone.
+REPOS_FILE="$STATE_DIR/repos.conf"
+local_src() {
+  [ -f "$REPOS_FILE" ] || return 0
+  local repo path
+  while IFS='=' read -r repo path; do
+    repo="${repo//[[:space:]]/}"
+    path="${path#"${path%%[![:space:]]*}"}"; path="${path%"${path##*[![:space:]]}"}"
+    [ "$repo" = "$1" ] || continue
+    printf '%s' "${path/#\~/$HOME}"; return
+  done < <(grep -v '^[[:space:]]*#' "$REPOS_FILE" 2>/dev/null)
+}
+[ -f "$REPOS_FILE" ] || cat > "$REPOS_FILE" <<'EOF'
+# herdr-pr-tracker repo map: "owner/name = /path/to/local/clone" per line.
+# 'cc' creates the per-PR checkout as a git worktree of the mapped clone
+# (fast, no network clone). Unmapped repos are cloned per PR as before.
+# keboola/ui = ~/gt/kbc-ui
+EOF
+
 # 'cc' verb: attach a fresh claude session to a PR in its own herdr workspace.
-# Clones the repo into a per-PR checkout dir (reused on later calls), checks
-# out the PR branch, spawns workspace + claude, and optionally types a
-# follow-up verb's template into the new session (":10ccar").
+# Checks out the PR into a per-PR dir (worktree of your mapped clone from
+# repos.conf, else a full clone; reused on later calls), spawns workspace +
+# claude, and optionally types a follow-up verb's template into the new
+# session (":10ccar").
 spawn_cc() {
   local n="$1" follow="$2"
   local url="${ROW_URL[$n]:-}" num repo dir out wsid pane root
   [ -z "$url" ] && return
   num="${url##*/}"
   repo="${url#https://github.com/}"; repo="${repo%%/pull/*}"
-  # ponytail: full clone per PR — simple and isolated; switch to shared clone
-  # + worktrees if big repos make this too slow
   dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num"
-  if [ ! -d "$dir/.git" ]; then
-    printf '  row %s: cloning %s … ' "$n" "$repo"
-    gh repo clone "$repo" "$dir" -- --quiet >/dev/null 2>&1 || { printf 'clone failed\n'; return; }
-    printf 'ok\n'
+  # worktrees have a .git *file*, clones a .git dir — -e covers both
+  if [ ! -e "$dir/.git" ]; then
+    local src; src="$(local_src "$repo")"
+    if [ -n "$src" ] && [ -e "$src/.git" ]; then
+      printf '  row %s: worktree of %s … ' "$n" "$src"
+      # ponytail: detached worktree; gh pr checkout below picks the PR branch.
+      # Fails if the PR branch is already checked out in the source clone —
+      # switch it away there and retry.
+      git -C "$src" fetch --quiet >/dev/null 2>&1
+      git -C "$src" worktree add --detach "$dir" >/dev/null 2>&1 || { printf 'worktree add failed\n'; return; }
+      printf 'ok\n'
+    else
+      printf '  row %s: cloning %s … ' "$n" "$repo"
+      gh repo clone "$repo" "$dir" -- --quiet >/dev/null 2>&1 || { printf 'clone failed\n'; return; }
+      printf 'ok\n'
+    fi
   fi
   (cd "$dir" && gh pr checkout "$url" >/dev/null 2>&1) || { printf '  row %s: gh pr checkout failed in %s\n' "$n" "$dir"; return; }
   out="$("$HERDR" workspace create --cwd "$dir" --label "PR #$num" --no-focus 2>/dev/null)"
