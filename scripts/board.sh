@@ -40,7 +40,7 @@ SCOPE="all"   # all | ws ('w' toggles); PR rows get numbers 1-9, others are just
 # TSV: number, title, ci, pr-state, merge, review, comment-count
 fetch_pr() {
   local url="$1" out="$2"
-  gh pr view "$url" --json number,title,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,comments,reviews 2>/dev/null \
+  gh pr view "$url" --json number,title,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,comments,reviews,author,reviewRequests 2>/dev/null \
   | jq -r '[(.number // "?"), (.title // ""),
             ([.statusCheckRollup[]?.conclusion // .statusCheckRollup[]?.state] | map(select(.!=null))
              | if length==0 then "-"
@@ -60,7 +60,10 @@ fetch_pr() {
              elif .reviewDecision=="CHANGES_REQUESTED" then "me"      # comments to address -> waiting on me
              elif .reviewDecision=="REVIEW_REQUIRED" then "them"      # waiting on reviewers
              else "-" end),
-            ((.comments|length) + ([.reviews[]? | select(.body != "")] | length))
+            ((.comments|length) + ([.reviews[]? | select(.body != "")] | length)),
+            (.author.login // "-"),
+            # pending reviewers: users have .login, teams have .name/.slug
+            ([.reviewRequests[]? | .login // .slug // .name // empty] | join(","))
            ] | @tsv' > "$out" 2>/dev/null
 }
 
@@ -134,16 +137,17 @@ render() {
   local -A SEEN=()
   for ((i=1; i<=n; i++)); do SEEN["${R_URL[$i]}"]=1; done
 
-  # pass 1c: PRs waiting for YOUR review (review requested from you) — shown
-  # right after the session rows, before your other PRs. 'cr' conducts the
-  # review; 'fin' takes the PR over when the author is away.
+  # pass 1c: PRs waiting for YOUR review (review requested from you, directly
+  # or via a team) — shown right after the session rows, before your other
+  # PRs. 'cr' conducts the review; 'fin' takes the PR over when the author is
+  # away. Dependabot PRs are excluded — the 'd' sweep owns those.
   if [ "$SCOPE" = all ]; then
     while IFS= read -r u2; do
       [ -z "$u2" ] && continue
       [ -n "${SEEN[$u2]:-}" ] && continue
       SEEN["$u2"]=1
       n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; R_KIND[$n]="rev"; WANT["$u2"]=1
-    done < <(gh search prs --review-requested=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' 2>/dev/null)
+    done < <(gh search prs --review-requested=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' -- -author:app/dependabot 2>/dev/null)
   fi
 
   # pass 1d: your other open PRs (no claude session) — authored by you or
@@ -176,16 +180,19 @@ render() {
       out+="  ${C_DIM}— waiting for your review (cr review · fin take over) —${C_RST}"$'\n'
     fi
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"; ROW_KIND[$idx]="${R_KIND[$idx]:-}"
-    local st mrg rev cmts rname
-    IFS=$'\t' read -r num title checks st mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
+    local st mrg rev cmts author reviewers rname revd
+    IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers < "$cache/${url//[:\/]/_}" 2>/dev/null || true
     rname="${url#https://github.com/}"; rname="${rname#*/}"; rname="${rname%%/pull/*}"
-    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-6s%s %s%s%s %s%s%s %3s  %.32s\n' \
+    # REVIEW shows WHO it waits on: →<first pending reviewer> instead of →them
+    revd="$(rev_sym "${rev:--}")"
+    [ "$rev" = them ] && [ -n "${reviewers:-}" ] && revd="→${reviewers%%,*}"
+    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-6s%s %s%s%s %s%s%s %-12.12s %3s  %.32s\n' \
       "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" "$rname" \
       "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
       "$(st_col "${st:-?}")"      "${st:-?}"                             "$C_RST" \
       "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
-      "$(rev_col "${rev:--}")"    "$(pad "$(rev_sym "${rev:--}")" 6)"    "$C_RST" \
-      "${cmts:-0}" "${title:-}"
+      "$(rev_col "${rev:--}")"    "$(pad "${revd:0:10}" 10)"             "$C_RST" \
+      "${author:--}" "${cmts:-0}" "${title:-}"
     out+="$line"
   done
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
@@ -204,8 +211,8 @@ render() {
   else
     printf '  %sno custom verbs — add them to %s (? for help)%s\n' "$C_DIM" "$CMDS_FILE" "$C_RST"
   fi
-  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-6s %-8s %-6s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "C" "TITLE" "$C_RST"
-  printf '  %s%s%s\n' "$C_DIM" "---------------------------------------------------------------------------------------------" "$C_RST"
+  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-6s %-8s %-10s %-12s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "AUTHOR" "C" "TITLE" "$C_RST"
+  printf '  %s%s%s\n' "$C_DIM" "--------------------------------------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
 }
 
@@ -479,17 +486,17 @@ dep_scan() {
 TRIAGE_BATCH=""
 triage() {
   TRIAGE_BATCH=""
-  local idx url num title ci st mrg rev cmts verb why cache="$STATE_DIR/prcache"
+  local idx url num title ci st mrg rev cmts author reviewers verb why cache="$STATE_DIR/prcache"
   printf '\n%s  triage:%s\n' "$C_BLD" "$C_RST"
   for ((idx=1; idx<=${#ROW_URL[@]}; idx++)); do
     url="${ROW_URL[$idx]:-}"; [ -z "$url" ] && continue
-    IFS=$'\t' read -r num title ci st mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
+    IFS=$'\t' read -r num title ci st mrg rev cmts author reviewers < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
     verb="$(suggest_verb "${ci:--}" "${st:-?}" "${mrg:-?}" "${rev:--}" "${ROW_KIND[$idx]:-}")"
     # session-less row + session-bound verb: suggest spawning a session first
     if [ -n "$verb" ] && [ -z "${ROW_PANE[$idx]:-}" ] && [[ "${CMDS[$verb]:-}" == @* ]]; then verb="cc$verb"; fi
     why=""
     if [ "${ROW_KIND[$idx]:-}" = rev ] && [ "$st" != merged ] && [ "$st" != closed ]; then
-      why="waiting for your review — conduct CR (\":${idx}fin\" takes it over if the author is away)"
+      why="by ${author:-?}, waiting for your review — conduct CR (\":${idx}fin\" takes it over if the author is away)"
     else
     case "$st" in merged|closed) why="" ;; *)
       [ "$mrg" = confl ]  && why="conflicts — rebase needed"

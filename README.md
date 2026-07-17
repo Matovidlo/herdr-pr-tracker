@@ -10,7 +10,8 @@ and renders a board with per-PR indicators:
 - **CI** — `✓` passing / `✗` failing / `…` running / `-` none
 - **ST** — PR lifecycle: `draft` · `ready` (published for review) · `merged` · `closed`
 - **MERGE** — pure mergeability, independent of draft-ness: `✓` mergeable · `✗confl` conflicts (rebase needed) · `↓behind` behind base
-- **REVIEW** — `←me` changes requested (waiting on you) · `→them` review requested (waiting on reviewers) · `✓` approved
+- **REVIEW** — `←me` changes requested (waiting on you) · `→<name>` review requested (waiting on that reviewer — first pending user/team) · `✓` approved
+- **AUTHOR** — the PR author's login
 - **C** — comment count (issue comments + review comments)
 
 ## Requirements
@@ -55,8 +56,12 @@ open browser tabs, so `1,2` opens two PRs at once.
 
 ### PRs waiting for your review
 In `all sessions` scope the board appends every open PR where **your review is
-requested** (`gh search prs --review-requested=@me`), right after the session
-rows under a `— waiting for your review —` separator. Two verbs target them:
+requested** (`gh search prs --review-requested=@me` — this includes reviews
+requested from a **team you belong to**, which is why the list can be longer
+than you expect), right after the session rows under a
+`— waiting for your review —` separator. **Dependabot PRs are excluded** —
+the `d` sweep owns repo-level dependency hygiene. The AUTHOR column and the
+reviewer name in REVIEW show whose PR it is and who it waits on. Two verbs target them:
 
 - `cr` — **conduct the code review** (the usual case): findings table with
   file:line, ranked by severity, never posted to GitHub without approval.
