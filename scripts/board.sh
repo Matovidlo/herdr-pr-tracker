@@ -15,7 +15,7 @@ for bin in gh jq; do
 done
 
 # rows[] is filled each cycle: "pane_id<TAB>agent<TAB>status<TAB>branch<TAB>pr_url"
-declare -a ROW_URL ROW_CWD
+declare -a ROW_URL ROW_CWD ROW_PANE ROW_STATUS
 # pane_id -> PR url; scraping pane scrollback is the slowest step, do it once
 # per pane and only rediscover on explicit refresh ('r').
 declare -A URL_CACHE
@@ -114,7 +114,7 @@ render() {
   done <<<"$agents"
   wait
   # pass 1b: fold discoveries into the cache, build rows
-  local -a R_AGENT=() R_STATUS=() R_URL=() R_CWD=()
+  local -a R_AGENT=() R_STATUS=() R_URL=() R_CWD=() R_PANE=()
   local -A WANT=()
   local n=0
   for ((i=1; i<=m; i++)); do
@@ -125,7 +125,7 @@ render() {
       URL_CACHE[$pane]="${url:--}"
     fi
     if [ "$url" = "-" ] || [ -z "$url" ]; then hidden=$((hidden+1)); continue; fi
-    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; WANT["$url"]=1
+    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; R_PANE[$n]="$pane"; WANT["$url"]=1
   done
 
   # pass 2: fetch all PR states in parallel, deduped — wall time = one gh call
@@ -136,10 +136,10 @@ render() {
   wait
 
   # pass 3: assemble off-screen, then draw in one shot (no flicker)
-  ROW_URL=(); ROW_CWD=()
+  ROW_URL=(); ROW_CWD=(); ROW_PANE=(); ROW_STATUS=()
   local line
   for ((idx=1; idx<=n; idx++)); do
-    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"
+    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"
     local mrg rev cmts
     IFS=$'\t' read -r num title checks mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
     printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %s%s%s %s%s%s %s%s%s %3s  %.32s\n' \
@@ -153,8 +153,9 @@ render() {
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
   [ "$hidden" -gt 0 ] && out+=$'\n'"  ${C_DIM}$n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)${C_RST}"$'\n'
 
+  [ -n "${QUIET:-}" ] && return   # headless --triage: collect rows, draw nothing
   clear
-  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
@@ -182,7 +183,20 @@ action_for() {
       tmpl="${tmpl//\{url\}/$url}"
       tmpl="${tmpl//\{num\}/${url##*/}}"
       tmpl="${tmpl//\{cwd\}/$cwd}"
-      (cd "${cwd:-.}" && bash -c "$tmpl") ;;
+      if [[ "$tmpl" == @* ]]; then
+        # '@' templates are typed INTO the PR's own claude session (visible in
+        # its pane, uses its context) instead of running here.
+        local pane="${ROW_PANE[$n]:-}" sts="${ROW_STATUS[$n]:-}"
+        [ -z "$pane" ] && { printf '  row %s: no pane to send to\n' "$n"; return; }
+        if [ "$sts" = working ]; then
+          printf '  row %s: session is busy (working) — skipped, retry when idle\n' "$n"; return
+        fi
+        "$HERDR" pane run "$pane" "${tmpl#@}" >/dev/null 2>&1 \
+          && printf '  row %s: sent to session %s\n' "$n" "$pane" \
+          || printf '  row %s: failed to send to %s\n' "$n" "$pane"
+      else
+        (cd "${cwd:-.}" && bash -c "$tmpl")
+      fi ;;
   esac
 }
 
@@ -203,8 +217,11 @@ load_cmds() {
 [ -f "$CMDS_FILE" ] || cat > "$CMDS_FILE" <<'EOF'
 # herdr-pr-tracker custom verbs, used from the ':' command line, e.g. ":1pr,2r".
 # <verb> = <command template>; runs in the PR's session cwd.
+# Prefix the template with '@' to type it into the PR's own claude session
+# instead (skipped while that session is working).
 # Placeholders: {url} {num} {cwd}
-# pr = claude -p "/prreview {url}"
+# pr = @/prreview {url}
+# ar = @/pr-comment-response {url}
 # r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
 EOF
 load_cmds
@@ -245,6 +262,67 @@ run_batch() {
   done
 }
 
+# map one row's indicators to a suggested verb; empty = nothing for you to do.
+# Skill verbs are only suggested when defined in commands.conf.
+suggest_verb() {
+  local ci="$1" mrg="$2" rev="$3"
+  case "$mrg" in confl|behind)
+    [ -n "${CMDS[r]:-}" ] && { echo r; return; }
+    echo c; return ;;   # no rebase verb defined: at least check it out
+  esac
+  if [ "$rev" = me ] || [ "$ci" = FAIL ]; then
+    [ -n "${CMDS[ar]:-}" ] && echo ar; return
+  fi
+  if [ "$mrg" = ok ] && [ "$rev" = appr ] && [ "$ci" != FAIL ] && [ "$ci" != "..." ]; then
+    echo m; return
+  fi
+  [ "$rev" = "-" ] && [ -n "${CMDS[pr]:-}" ] && echo pr
+}
+
+# go through every row, print why each one needs (or doesn't need) attention,
+# and assemble the suggested batch into TRIAGE_BATCH.
+TRIAGE_BATCH=""
+triage() {
+  TRIAGE_BATCH=""
+  local idx url num title ci mrg rev cmts verb why cache="$STATE_DIR/prcache"
+  printf '\n%s  triage:%s\n' "$C_BLD" "$C_RST"
+  for ((idx=1; idx<=${#ROW_URL[@]}; idx++)); do
+    url="${ROW_URL[$idx]:-}"; [ -z "$url" ] && continue
+    IFS=$'\t' read -r num title ci mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
+    verb="$(suggest_verb "${ci:--}" "${mrg:-?}" "${rev:--}")"
+    why=""
+    [ "$mrg" = confl ]  && why="conflicts — rebase needed"
+    [ "$mrg" = behind ] && why="behind base — rebase/update"
+    [ -z "$why" ] && [ "$rev" = me ] && why="review comments waiting on you"
+    [ -z "$why" ] && [ "$ci" = FAIL ] && why="CI failing"
+    [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = m ] && why="green and approved — mergeable"
+    [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = pr ] && why="no review yet — run your review skill"
+    if [ -n "$verb" ]; then
+      printf '  %s%d%s%s  #%-6s %s\n' "$C_YEL" "$idx" "$verb" "$C_RST" "${num:-?}" "$why"
+      TRIAGE_BATCH+="${TRIAGE_BATCH:+,}$idx$verb"
+    else
+      if [ -n "$why" ]; then   # attention needed but no verb defined in commands.conf
+        printf '  %s%d   #%-6s %s — define a verb in commands.conf%s\n' "$C_DIM" "$idx" "${num:-?}" "$why" "$C_RST"
+      else
+        printf '  %s%d   #%-6s nothing to do%s\n' "$C_DIM" "$idx" "${num:-?}" "$C_RST"
+      fi
+    fi
+  done
+}
+
+# headless daily routine: board.sh --triage [--execute]
+# Prints suggestions (and a herdr notification); --execute also runs them.
+# Cron example:  0 9 * * 1-5  bash .../scripts/board.sh --triage --execute
+if [ "${1:-}" = "--triage" ]; then
+  QUIET=1 render
+  triage
+  if [ -n "$TRIAGE_BATCH" ]; then
+    "$HERDR" notification show "PR triage" --body "suggested: $TRIAGE_BATCH" >/dev/null 2>&1 || true
+    [ "${2:-}" = "--execute" ] && run_batch "$TRIAGE_BATCH"
+  fi
+  exit 0
+fi
+
 PENDING_VERB="open"
 NUMBUF=""
 while :; do
@@ -256,6 +334,17 @@ while :; do
     case "$key" in
       q) clear; exit 0 ;;
       r) URL_CACHE=(); NUMBUF=""; load_cmds; break ;;
+      t)  # triage: suggest a batch from the indicators, Enter to run it
+        triage
+        if [ -n "$TRIAGE_BATCH" ]; then
+          printf '\n  suggested: %s%s%s — Enter to run, any other key to cancel ' "$C_BLD" "$TRIAGE_BATCH" "$C_RST"
+          IFS= read -rsn1 k2 || k2=x
+          if [ -z "$k2" ]; then printf '\n'; run_batch "$TRIAGE_BATCH"; printf '  (any key to refresh) '; IFS= read -rsn1 -t 30 _ || true; fi
+        else
+          printf '\n  nothing needs attention — press any key '
+          IFS= read -rsn1 -t 30 _ || true
+        fi
+        NUMBUF=""; break ;;
       w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; NUMBUF=""; break ;;
       c) PENDING_VERB="checkout"; NUMBUF=""; printf '\r  [checkout] type row number + Enter … ' ;;
       m) PENDING_VERB="merge";    NUMBUF=""; printf '\r  [merge] type row number + Enter … '    ;;
