@@ -52,10 +52,23 @@ number + `Enter` = checkout / merge / edit plan note · `r` full refresh ·
 Verbs: *(none)*/`o` open · `c` checkout · `m` merge · `p` plan. Plain numbers
 open browser tabs, so `1,2` opens two PRs at once.
 
-### Rows without a session (all your authored PRs)
-Besides the PRs of running claude sessions, the board appends **every open PR
-you authored** (via `gh search prs --author=@me`), sorted by latest update,
-with `-` in the AGENT/STATUS columns. Use `cc` to attach a session to one.
+### Rows without a session (your authored/assigned PRs) — opt-in
+Besides the PRs of running claude sessions, the board can append **every open
+PR you authored or are assigned to** (via `gh search prs --author=@me` +
+`--assignee=@me`, deduped — assigned dependabot PRs show up too), sorted by
+latest update, with `-` in the AGENT/STATUS columns. Use `cc` to attach a
+session to one.
+
+This is **disabled by default** (sessions-only board). Enable it per machine
+by touching `show-authored` in the plugin's state dir — under herdr that is
+`$HERDR_PLUGIN_STATE_DIR`, the same dir that holds `commands.conf`:
+
+```sh
+touch ~/.local/state/herdr/plugins/martinv.pr-tracker/show-authored
+```
+
+Delete the file to go back to sessions-only. Only applies in `all sessions`
+scope (`w`), and the board reads it every render — no restart needed.
 
 ### `cc` — spawn a claude session for a PR
 `:10cc` clones the PR's repo into `$HERDR_PLUGIN_STATE_DIR/checkouts/<repo>-pr<N>`

@@ -130,17 +130,21 @@ render() {
     n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; R_PANE[$n]="$pane"; WANT["$url"]=1
   done
 
-  # pass 1c: your other open authored PRs (no claude session), newest activity
-  # first, appended after the session rows — 'cc' can attach a session to them.
-  if [ "$SCOPE" = all ]; then
+  # pass 1c: your other open PRs (no claude session) — authored by you or
+  # assigned to you — newest activity first, appended after the session rows;
+  # 'cc' can attach a session to them.
+  # Opt-in per machine: touch "$STATE_DIR/show-authored" to enable.
+  if [ "$SCOPE" = all ] && [ -f "$STATE_DIR/show-authored" ]; then
     local u2
     local -A SEEN=()
     for ((i=1; i<=n; i++)); do SEEN["${R_URL[$i]}"]=1; done
     while IFS= read -r u2; do
       [ -z "$u2" ] && continue
       [ -n "${SEEN[$u2]:-}" ] && continue
+      SEEN["$u2"]=1
       n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; WANT["$u2"]=1
-    done < <(gh search prs --author=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' 2>/dev/null)
+    done < <({ gh search prs --author=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'
+               gh search prs --assignee=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'; } 2>/dev/null)
   fi
 
   # pass 2: fetch all PR states in parallel, deduped — wall time = one gh call
