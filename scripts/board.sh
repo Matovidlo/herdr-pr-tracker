@@ -291,19 +291,23 @@ spawn_cc() {
   # worktrees have a .git *file*, clones a .git dir — -e covers both
   if [ ! -e "$dir/.git" ]; then
     local src; src="$(local_src "$repo")"
-    if [ -n "$src" ] && [ -e "$src/.git" ]; then
-      printf '  row %s: worktree of %s … ' "$n" "$src"
-      # ponytail: detached worktree; gh pr checkout below picks the PR branch.
-      # Fails if the PR branch is already checked out in the source clone —
-      # switch it away there and retry.
-      git -C "$src" fetch --quiet >/dev/null 2>&1
-      git -C "$src" worktree add --detach "$dir" >/dev/null 2>&1 || { printf 'worktree add failed\n'; return; }
-      printf 'ok\n'
-    else
-      printf '  row %s: cloning %s … ' "$n" "$repo"
-      gh repo clone "$repo" "$dir" -- --quiet >/dev/null 2>&1 || { printf 'clone failed\n'; return; }
-      printf 'ok\n'
+    if [ -z "$src" ] || [ ! -e "$src/.git" ]; then
+      # no mapped clone: keep ONE shared clone per repo under checkouts/ and
+      # hang every per-PR checkout off it as a worktree (clone paid once)
+      src="$STATE_DIR/checkouts/${repo//\//_}"
+      if [ ! -e "$src/.git" ]; then
+        printf '  row %s: cloning %s … ' "$n" "$repo"
+        gh repo clone "$repo" "$src" -- --quiet >/dev/null 2>&1 || { printf 'clone failed\n'; return; }
+        printf 'ok\n'
+      fi
     fi
+    printf '  row %s: worktree of %s … ' "$n" "$src"
+    # ponytail: detached worktree; gh pr checkout below picks the PR branch.
+    # Fails if the PR branch is already checked out in the source clone —
+    # switch it away there and retry.
+    git -C "$src" fetch --quiet >/dev/null 2>&1
+    git -C "$src" worktree add --detach "$dir" >/dev/null 2>&1 || { printf 'worktree add failed\n'; return; }
+    printf 'ok\n'
   fi
   (cd "$dir" && gh pr checkout "$url" >/dev/null 2>&1) || { printf '  row %s: gh pr checkout failed in %s\n' "$n" "$dir"; return; }
   out="$("$HERDR" workspace create --cwd "$dir" --label "PR #$num" --no-focus 2>/dev/null)"

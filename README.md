@@ -96,17 +96,19 @@ scope (`w`), and the board reads it every render — no restart needed.
 (reused next time), creates a **new herdr workspace**
 labeled `PR #N`, and starts claude in it.
 
-By default the checkout is a fresh `gh repo clone`. If you already have the
-repo on disk, map it in `$HERDR_PLUGIN_STATE_DIR/repos.conf` (created with an
-example on first run, same dir as `commands.conf`, never committed):
+Every per-PR checkout is a **`git worktree`**, never a full clone per PR. The
+worktree hangs off your own clone if the repo is mapped in
+`$HERDR_PLUGIN_STATE_DIR/repos.conf` (created with an example on first run,
+same dir as `commands.conf`, never committed):
 
 ```conf
 # owner/name = /path/to/local/clone   (~ expands)
 keboola/ui = ~/gt/kbc-ui
 ```
 
-Mapped repos get the per-PR checkout as a **`git worktree` of your clone** —
-instant, no network clone, and your working copy is untouched. One caveat:
+Unmapped repos are cloned **once** into `checkouts/<repo>` and all their PR
+worktrees share that clone. Mapped repos skip the clone entirely — instant,
+offline, and your working copy is untouched. One caveat:
 git refuses a worktree for a branch that is already checked out in the source
 clone, so if you're sitting on the PR's branch there, switch away first. Combine it with any verb:
 `:10ccar` = spawn the workspace, wait for claude to boot, then type the `ar`
