@@ -79,6 +79,15 @@ ci_sym()  { case "$1" in ok) echo "✓";; FAIL) echo "✗";; ...) echo "…";; *
 mrg_sym() { case "$1" in ok) echo "✓";; confl) echo "✗confl";; behind) echo "↓behind";; no) echo "✗";; *) echo "$1";; esac; }
 rev_sym() { case "$1" in appr) echo "✓";; me) echo "←me";; them) echo "→them";; *) echo "-";; esac; }
 
+# ANSI palette; colors wrap the already-padded field so escape codes (zero
+# display width) never enter pad()'s byte math.
+C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YEL=$'\033[33m' C_MAG=$'\033[35m'
+C_CYN=$'\033[36m' C_DIM=$'\033[2m'  C_BLD=$'\033[1m'  C_RST=$'\033[0m'
+ci_col()  { case "$1" in ok) printf %s "$C_GRN";; FAIL) printf %s "$C_RED";; ...) printf %s "$C_YEL";; esac; }
+mrg_col() { case "$1" in ok) printf %s "$C_GRN";; confl|no) printf %s "$C_RED";; behind) printf %s "$C_YEL";; merged) printf %s "$C_MAG";; draft|closed) printf %s "$C_DIM";; esac; }
+rev_col() { case "$1" in appr) printf %s "$C_GRN";; me) printf %s "$C_RED";; them) printf %s "$C_YEL";; esac; }
+sts_col() { case "$1" in working) printf %s "$C_GRN";; blocked) printf %s "$C_RED";; idle|done) printf %s "$C_DIM";; esac; }
+
 render() {
   local idx=0 hidden=0 agents pane agent status cwd url num title state checks out=""
   # One jq pass over all agents; current workspace's sessions sort first,
@@ -133,20 +142,24 @@ render() {
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"
     local mrg rev cmts
     IFS=$'\t' read -r num title checks mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
-    printf -v line '  %-16.16s %-9s %3s  #%-6s %s %s %s %3s  %.32s\n' \
-      "${R_AGENT[$idx]}" "${R_STATUS[$idx]}" "$idx" "${num:-?}" \
-      "$(pad "$(ci_sym "${checks:--}")" 3)" "$(pad "$(mrg_sym "${mrg:-?}")" 8)" \
-      "$(pad "$(rev_sym "${rev:--}")" 6)" "${cmts:-0}" "${title:-}"
+    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %s%s%s %s%s%s %s%s%s %3s  %.32s\n' \
+      "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" \
+      "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
+      "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
+      "$(rev_col "${rev:--}")"    "$(pad "$(rev_sym "${rev:--}")" 6)"    "$C_RST" \
+      "${cmts:-0}" "${title:-}"
     out+="$line"
   done
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
-  [ "$hidden" -gt 0 ] && out+=$'\n'"  $n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)"$'\n'
+  [ "$hidden" -gt 0 ] && out+=$'\n'"  ${C_DIM}$n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)${C_RST}"$'\n'
 
   clear
-  printf '\033[1m  Claude PR Tracker\033[0m [%s]  (number+Enter open · r refresh · c checkout · m merge · p plan · w scope · q quit)\n' \
-    "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )"
-  printf '  %-16s %-9s %3s  %-7s %-3s %-8s %-6s %3s  %s\n' "AGENT" "STATUS" "N" "PR" "CI" "MERGE" "REVIEW" "C" "TITLE"
-  printf '  %s\n' "------------------------------------------------------------------------------"
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
+    "$C_BLD" "$C_RST" \
+    "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
+    "$C_DIM" "$C_RST"
+  printf '%s  %-16s %-9s %3s  %-7s %-3s %-8s %-6s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "CI" "MERGE" "REVIEW" "C" "TITLE" "$C_RST"
+  printf '  %s%s%s\n' "$C_DIM" "------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
 }
 
