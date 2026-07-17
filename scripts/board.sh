@@ -158,10 +158,17 @@ render() {
 
   [ -n "${QUIET:-}" ] && return   # headless --triage: collect rows, draw nothing
   clear
-  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · ? help · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
+  # surface the loaded custom verbs so ":1pr,2ar" possibilities are discoverable
+  if [ ${#CMDS[@]} -gt 0 ]; then
+    printf '  %sverbs: o c m p + %s  (? shows templates)%s\n' "$C_DIM" \
+      "$(printf '%s\n' "${!CMDS[@]}" | sort | tr '\n' ' ')" "$C_RST"
+  else
+    printf '  %sno custom verbs — add them to %s (? for help)%s\n' "$C_DIM" "$CMDS_FILE" "$C_RST"
+  fi
   printf '%s  %-16s %-9s %3s  %-7s %-3s %-6s %-8s %-6s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "CI" "ST" "MERGE" "REVIEW" "C" "TITLE" "$C_RST"
   printf '  %s%s%s\n' "$C_DIM" "------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
@@ -227,8 +234,27 @@ load_cmds() {
 # ar  = @/pr-comment-response {url}
 # pub = gh pr ready {url}
 # r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
+# rs = @/goal CI on {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green
 EOF
 load_cmds
+
+# full help: keys, batch syntax, built-in verbs, and every loaded custom verb
+show_help() {
+  printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p then <n>+Enter checkout/merge/plan · : batch · t triage · r refresh · w scope · q quit\n' "$C_BLD" "$C_RST"
+  printf '%s  batch%s     :<row><verb>[,<row><verb>…]  e.g. ":1pr,2m,3r,4ar" — no verb = open, so ":1,2" opens two tabs\n' "$C_BLD" "$C_RST"
+  printf '%s  built-in%s  o open · c checkout · m merge · p plan\n' "$C_BLD" "$C_RST"
+  if [ ${#CMDS[@]} -gt 0 ]; then
+    printf '%s  custom%s    from %s ('"'"'@'"'"' = typed into the PR'"'"'s claude session):\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
+    local v
+    while IFS= read -r v; do
+      printf '    %-5s = %s\n' "$v" "${CMDS[$v]}"
+    done < <(printf '%s\n' "${!CMDS[@]}" | sort)
+  else
+    printf '%s  custom%s    none yet — add "verb = template" lines to %s\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
+  fi
+  printf '\n  press any key to return '
+  IFS= read -rsn1 -t 60 _ || true
+}
 
 # resolve a short verb token to an action_for verb; empty = open.
 # Built-ins win; anything else looks up commands.conf (-> "cmd:<verb>").
@@ -358,6 +384,7 @@ while :; do
         fi
         NUMBUF=""; break ;;
       w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; NUMBUF=""; break ;;
+      '?') show_help; NUMBUF=""; break ;;   # NB: quoted — bare ? is a glob matching any key
       c) PENDING_VERB="checkout"; NUMBUF=""; printf '\r  [checkout] type row number + Enter … ' ;;
       m) PENDING_VERB="merge";    NUMBUF=""; printf '\r  [merge] type row number + Enter … '    ;;
       p) PENDING_VERB="plan";     NUMBUF=""; printf '\r  [plan] type row number + Enter … '     ;;
