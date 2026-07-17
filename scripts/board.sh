@@ -82,6 +82,8 @@ pad() {
 ci_sym()  { case "$1" in ok) echo "✓";; FAIL) echo "✗";; ...) echo "…";; *) echo "-";; esac; }
 mrg_sym() { case "$1" in ok) echo "✓";; confl) echo "✗confl";; behind) echo "↓behind";; no) echo "✗";; *) echo "$1";; esac; }
 rev_sym() { case "$1" in appr) echo "✓";; me) echo "←me";; them) echo "→them";; *) echo "-";; esac; }
+# one colored letter for PR lifecycle: D draft, R ready, M merged, C closed
+st_sym()  { case "$1" in ready) echo "R";; draft) echo "D";; merged) echo "M";; closed) echo "C";; *) echo "?";; esac; }
 
 # ANSI palette; colors wrap the already-padded field so escape codes (zero
 # display width) never enter pad()'s byte math.
@@ -186,12 +188,12 @@ render() {
     # REVIEW shows WHO it waits on: →<first pending reviewer> instead of →them
     revd="$(rev_sym "${rev:--}")"
     [ "$rev" = them ] && [ -n "${reviewers:-}" ] && revd="→${reviewers%%,*}"
-    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-6s%s %s%s%s %s%s%s %-12.12s %3s  %.32s\n' \
+    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-2s%s %s%s%s %s%s%s %-12.12s %3s  %.32s\n' \
       "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" "$rname" \
       "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
-      "$(st_col "${st:-?}")"      "${st:-?}"                             "$C_RST" \
+      "$(st_col "${st:-?}")"      "$(st_sym "${st:-?}")"                 "$C_RST" \
       "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
-      "$(rev_col "${rev:--}")"    "$(pad "${revd:0:10}" 10)"             "$C_RST" \
+      "$(rev_col "${rev:--}")"    "$(pad "${revd:0:14}" 14)"             "$C_RST" \
       "${author:--}" "${cmts:-0}" "${title:-}"
     out+="$line"
   done
@@ -211,7 +213,7 @@ render() {
   else
     printf '  %sno custom verbs — add them to %s (? for help)%s\n' "$C_DIM" "$CMDS_FILE" "$C_RST"
   fi
-  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-6s %-8s %-10s %-12s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "AUTHOR" "C" "TITLE" "$C_RST"
+  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-2s %-8s %-14s %-12s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "AUTHOR" "C" "TITLE" "$C_RST"
   printf '  %s%s%s\n' "$C_DIM" "--------------------------------------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
 }

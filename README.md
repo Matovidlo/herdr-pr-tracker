@@ -8,7 +8,7 @@ recent output for a `…/pull/N` URL, falling back to `gh pr list --head <branch
 and renders a board with per-PR indicators:
 
 - **CI** — `✓` passing / `✗` failing / `…` running / `-` none
-- **ST** — PR lifecycle: `draft` · `ready` (published for review) · `merged` · `closed`
+- **ST** — PR lifecycle, one colored letter: `D` draft (yellow) · `R` ready/published (green) · `M` merged (magenta) · `C` closed (dim)
 - **MERGE** — pure mergeability, independent of draft-ness: `✓` mergeable · `✗confl` conflicts (rebase needed) · `↓behind` behind base
 - **REVIEW** — `←me` changes requested (waiting on you) · `→<name>` review requested (waiting on that reviewer — first pending user/team) · `✓` approved
 - **AUTHOR** — the PR author's login
