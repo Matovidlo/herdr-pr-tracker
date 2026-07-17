@@ -153,8 +153,9 @@ render() {
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
   [ "$hidden" -gt 0 ] && out+=$'\n'"  ${C_DIM}$n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)${C_RST}"$'\n'
 
+  [ -n "${QUIET:-}" ] && return   # headless --triage: collect rows, draw nothing
   clear
-  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
@@ -261,6 +262,67 @@ run_batch() {
   done
 }
 
+# map one row's indicators to a suggested verb; empty = nothing for you to do.
+# Skill verbs are only suggested when defined in commands.conf.
+suggest_verb() {
+  local ci="$1" mrg="$2" rev="$3"
+  case "$mrg" in confl|behind)
+    [ -n "${CMDS[r]:-}" ] && { echo r; return; }
+    echo c; return ;;   # no rebase verb defined: at least check it out
+  esac
+  if [ "$rev" = me ] || [ "$ci" = FAIL ]; then
+    [ -n "${CMDS[ar]:-}" ] && echo ar; return
+  fi
+  if [ "$mrg" = ok ] && [ "$rev" = appr ] && [ "$ci" != FAIL ] && [ "$ci" != "..." ]; then
+    echo m; return
+  fi
+  [ "$rev" = "-" ] && [ -n "${CMDS[pr]:-}" ] && echo pr
+}
+
+# go through every row, print why each one needs (or doesn't need) attention,
+# and assemble the suggested batch into TRIAGE_BATCH.
+TRIAGE_BATCH=""
+triage() {
+  TRIAGE_BATCH=""
+  local idx url num title ci mrg rev cmts verb why cache="$STATE_DIR/prcache"
+  printf '\n%s  triage:%s\n' "$C_BLD" "$C_RST"
+  for ((idx=1; idx<=${#ROW_URL[@]}; idx++)); do
+    url="${ROW_URL[$idx]:-}"; [ -z "$url" ] && continue
+    IFS=$'\t' read -r num title ci mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
+    verb="$(suggest_verb "${ci:--}" "${mrg:-?}" "${rev:--}")"
+    why=""
+    [ "$mrg" = confl ]  && why="conflicts — rebase needed"
+    [ "$mrg" = behind ] && why="behind base — rebase/update"
+    [ -z "$why" ] && [ "$rev" = me ] && why="review comments waiting on you"
+    [ -z "$why" ] && [ "$ci" = FAIL ] && why="CI failing"
+    [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = m ] && why="green and approved — mergeable"
+    [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = pr ] && why="no review yet — run your review skill"
+    if [ -n "$verb" ]; then
+      printf '  %s%d%s%s  #%-6s %s\n' "$C_YEL" "$idx" "$verb" "$C_RST" "${num:-?}" "$why"
+      TRIAGE_BATCH+="${TRIAGE_BATCH:+,}$idx$verb"
+    else
+      if [ -n "$why" ]; then   # attention needed but no verb defined in commands.conf
+        printf '  %s%d   #%-6s %s — define a verb in commands.conf%s\n' "$C_DIM" "$idx" "${num:-?}" "$why" "$C_RST"
+      else
+        printf '  %s%d   #%-6s nothing to do%s\n' "$C_DIM" "$idx" "${num:-?}" "$C_RST"
+      fi
+    fi
+  done
+}
+
+# headless daily routine: board.sh --triage [--execute]
+# Prints suggestions (and a herdr notification); --execute also runs them.
+# Cron example:  0 9 * * 1-5  bash .../scripts/board.sh --triage --execute
+if [ "${1:-}" = "--triage" ]; then
+  QUIET=1 render
+  triage
+  if [ -n "$TRIAGE_BATCH" ]; then
+    "$HERDR" notification show "PR triage" --body "suggested: $TRIAGE_BATCH" >/dev/null 2>&1 || true
+    [ "${2:-}" = "--execute" ] && run_batch "$TRIAGE_BATCH"
+  fi
+  exit 0
+fi
+
 PENDING_VERB="open"
 NUMBUF=""
 while :; do
@@ -272,6 +334,17 @@ while :; do
     case "$key" in
       q) clear; exit 0 ;;
       r) URL_CACHE=(); NUMBUF=""; load_cmds; break ;;
+      t)  # triage: suggest a batch from the indicators, Enter to run it
+        triage
+        if [ -n "$TRIAGE_BATCH" ]; then
+          printf '\n  suggested: %s%s%s — Enter to run, any other key to cancel ' "$C_BLD" "$TRIAGE_BATCH" "$C_RST"
+          IFS= read -rsn1 k2 || k2=x
+          if [ -z "$k2" ]; then printf '\n'; run_batch "$TRIAGE_BATCH"; printf '  (any key to refresh) '; IFS= read -rsn1 -t 30 _ || true; fi
+        else
+          printf '\n  nothing needs attention — press any key '
+          IFS= read -rsn1 -t 30 _ || true
+        fi
+        NUMBUF=""; break ;;
       w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; NUMBUF=""; break ;;
       c) PENDING_VERB="checkout"; NUMBUF=""; printf '\r  [checkout] type row number + Enter … ' ;;
       m) PENDING_VERB="merge";    NUMBUF=""; printf '\r  [merge] type row number + Enter … '    ;;
