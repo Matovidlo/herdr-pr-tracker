@@ -28,8 +28,11 @@ find_pr() {
         | grep -oiE "$PR_URL_RE" | tail -1)"
   if [ -z "$url" ] && [ -n "$cwd" ] && [ -d "$cwd" ]; then
     branch="$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null)"
-    # gh resolves the repo from $PWD — must run in the pane's cwd, not ours
-    [ -n "$branch" ] && url="$(cd "$cwd" && gh pr list --head "$branch" --json url --jq '.[0].url // empty' 2>/dev/null)"
+    # gh resolves the repo from $PWD — must run in the pane's cwd, not ours.
+    # --state all: a session whose PR already merged/closed still gets its row
+    # (shown as M/C) instead of silently hiding; open PRs win when both exist.
+    [ -n "$branch" ] && url="$(cd "$cwd" && gh pr list --head "$branch" --state all --limit 10 --json url,state \
+      --jq '(map(select(.state=="OPEN")) + .) | .[0].url // empty' 2>/dev/null)"
   fi
   printf '%s' "$url"
 }
