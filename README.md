@@ -41,6 +41,16 @@ Type a row number + `Enter` to open that PR in the browser · `c`/`m`/`p` then
 number + `Enter` = checkout / merge / edit plan note · `r` full refresh ·
 `w` toggle current-workspace-only ⇄ all sessions · `q` quit.
 
+`:` opens a **command line** for batch actions — comma-separated
+`<row><verb>` tokens run in order:
+
+```
+:1,2c,3m     # open PR 1 in the browser, checkout PR 2, merge PR 3
+```
+
+Verbs: *(none)*/`o` open · `c` checkout · `m` merge · `p` plan. Plain numbers
+open browser tabs, so `1,2` opens two PRs at once.
+
 Sessions from the board's own workspace sort first; sessions with no PR are
 hidden behind a `+N session(s) without a PR` footer.
 

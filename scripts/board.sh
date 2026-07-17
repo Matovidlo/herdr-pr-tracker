@@ -79,6 +79,15 @@ ci_sym()  { case "$1" in ok) echo "✓";; FAIL) echo "✗";; ...) echo "…";; *
 mrg_sym() { case "$1" in ok) echo "✓";; confl) echo "✗confl";; behind) echo "↓behind";; no) echo "✗";; *) echo "$1";; esac; }
 rev_sym() { case "$1" in appr) echo "✓";; me) echo "←me";; them) echo "→them";; *) echo "-";; esac; }
 
+# ANSI palette; colors wrap the already-padded field so escape codes (zero
+# display width) never enter pad()'s byte math.
+C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YEL=$'\033[33m' C_MAG=$'\033[35m'
+C_CYN=$'\033[36m' C_DIM=$'\033[2m'  C_BLD=$'\033[1m'  C_RST=$'\033[0m'
+ci_col()  { case "$1" in ok) printf %s "$C_GRN";; FAIL) printf %s "$C_RED";; ...) printf %s "$C_YEL";; esac; }
+mrg_col() { case "$1" in ok) printf %s "$C_GRN";; confl|no) printf %s "$C_RED";; behind) printf %s "$C_YEL";; merged) printf %s "$C_MAG";; draft|closed) printf %s "$C_DIM";; esac; }
+rev_col() { case "$1" in appr) printf %s "$C_GRN";; me) printf %s "$C_RED";; them) printf %s "$C_YEL";; esac; }
+sts_col() { case "$1" in working) printf %s "$C_GRN";; blocked) printf %s "$C_RED";; idle|done) printf %s "$C_DIM";; esac; }
+
 render() {
   local idx=0 hidden=0 agents pane agent status cwd url num title state checks out=""
   # One jq pass over all agents; current workspace's sessions sort first,
@@ -133,20 +142,24 @@ render() {
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"
     local mrg rev cmts
     IFS=$'\t' read -r num title checks mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
-    printf -v line '  %-16.16s %-9s %3s  #%-6s %s %s %s %3s  %.32s\n' \
-      "${R_AGENT[$idx]}" "${R_STATUS[$idx]}" "$idx" "${num:-?}" \
-      "$(pad "$(ci_sym "${checks:--}")" 3)" "$(pad "$(mrg_sym "${mrg:-?}")" 8)" \
-      "$(pad "$(rev_sym "${rev:--}")" 6)" "${cmts:-0}" "${title:-}"
+    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %s%s%s %s%s%s %s%s%s %3s  %.32s\n' \
+      "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" \
+      "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
+      "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
+      "$(rev_col "${rev:--}")"    "$(pad "$(rev_sym "${rev:--}")" 6)"    "$C_RST" \
+      "${cmts:-0}" "${title:-}"
     out+="$line"
   done
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
-  [ "$hidden" -gt 0 ] && out+=$'\n'"  $n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)"$'\n'
+  [ "$hidden" -gt 0 ] && out+=$'\n'"  ${C_DIM}$n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)${C_RST}"$'\n'
 
   clear
-  printf '\033[1m  Claude PR Tracker\033[0m [%s]  (number+Enter open · r refresh · c checkout · m merge · p plan · w scope · q quit)\n' \
-    "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )"
-  printf '  %-16s %-9s %3s  %-7s %-3s %-8s %-6s %3s  %s\n' "AGENT" "STATUS" "N" "PR" "CI" "MERGE" "REVIEW" "C" "TITLE"
-  printf '  %s\n' "------------------------------------------------------------------------------"
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
+    "$C_BLD" "$C_RST" \
+    "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
+    "$C_DIM" "$C_RST"
+  printf '%s  %-16s %-9s %3s  %-7s %-3s %-8s %-6s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "CI" "MERGE" "REVIEW" "C" "TITLE" "$C_RST"
+  printf '  %s%s%s\n' "$C_DIM" "------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
 }
 
@@ -166,6 +179,41 @@ action_for() {
   esac
 }
 
+# resolve a short verb token to an action_for verb; empty = open
+resolve_verb() {
+  case "$1" in
+    ''|o) echo open ;;
+    c)    echo checkout ;;
+    m)    echo merge ;;
+    p)    echo plan ;;
+    *)    return 1 ;;
+  esac
+}
+
+# batch line: comma/space-separated "<row><verb>" tokens, e.g. "1,2c,3m".
+# Plain numbers open in the browser, so "1,2" opens two tabs.
+run_batch() {
+  local tok n verb
+  local -a toks
+  IFS=', ' read -ra toks <<<"$1"
+  for tok in "${toks[@]}"; do
+    [ -z "$tok" ] && continue
+    if [[ "$tok" =~ ^([0-9]+)([a-z]*)$ ]]; then
+      n="${BASH_REMATCH[1]}"
+      if ! verb="$(resolve_verb "${BASH_REMATCH[2]}")"; then
+        printf '  %s: unknown verb "%s"\n' "$tok" "${BASH_REMATCH[2]}"; continue
+      fi
+      if [ -z "${ROW_URL[$n]:-}" ]; then
+        printf '  %s: no PR on row %s (rows: 1-%s)\n' "$tok" "$n" "${#ROW_URL[@]}"; continue
+      fi
+      printf '  %s → %s row %s\n' "$tok" "$verb" "$n"
+      action_for "$n" "$verb"
+    else
+      printf '  skipping unrecognized token: %s\n' "$tok"
+    fi
+  done
+}
+
 PENDING_VERB="open"
 NUMBUF=""
 while :; do
@@ -181,6 +229,15 @@ while :; do
       c) PENDING_VERB="checkout"; NUMBUF=""; printf '\r  [checkout] type row number + Enter … ' ;;
       m) PENDING_VERB="merge";    NUMBUF=""; printf '\r  [merge] type row number + Enter … '    ;;
       p) PENDING_VERB="plan";     NUMBUF=""; printf '\r  [plan] type row number + Enter … '     ;;
+      :)  # command line: "1,2c,3m" + Enter runs each token in order
+        printf '\r  cmd> '
+        IFS= read -r cmdline || cmdline=""
+        printf '\n'
+        [ -n "$cmdline" ] && run_batch "$cmdline"
+        NUMBUF=""; PENDING_VERB="open"
+        printf '  (any key to refresh) '
+        IFS= read -rsn1 -t 30 _ || true
+        break ;;
       [0-9]) NUMBUF+="$key"; printf '\r  %s row: %s (Enter to run) ' "$PENDING_VERB" "$NUMBUF" ;;
       ''|$'\n'|$'\r')   # Enter — read -n1 yields '' for newline
         [ -z "$NUMBUF" ] && continue
