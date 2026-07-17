@@ -52,27 +52,46 @@ number + `Enter` = checkout / merge / edit plan note · `r` full refresh ·
 Verbs: *(none)*/`o` open · `c` checkout · `m` merge · `p` plan. Plain numbers
 open browser tabs, so `1,2` opens two PRs at once.
 
-### Custom verbs (your own skills/commands)
-Define extra verbs in `$HERDR_PLUGIN_STATE_DIR/commands.conf` (an example file
-is created on first run). One `verb = command template` per line; placeholders
-`{url}` `{num}` `{cwd}` are substituted and the command runs in that PR's
-session working directory:
+### Rows without a session (all your authored PRs)
+Besides the PRs of running claude sessions, the board appends **every open PR
+you authored** (via `gh search prs --author=@me`), sorted by latest update,
+with `-` in the AGENT/STATUS columns. Use `cc` to attach a session to one.
+
+### `cc` — spawn a claude session for a PR
+`:10cc` clones the PR's repo into `$HERDR_PLUGIN_STATE_DIR/checkouts/<repo>-pr<N>`
+(reused next time), checks out the PR branch, creates a **new herdr workspace**
+labeled `PR #N`, and starts claude in it. Combine it with any verb:
+`:10ccar` = spawn the workspace, wait for claude to boot, then type the `ar`
+template into the new session — e.g. "new workspace, claude attached to that
+PR, addressing the review".
+
+### Verbs: built-in defaults + your overrides
+The plugin ships **default verbs** that work out of the box (generic prompts,
+no personal skills required):
+
+| verb | default action |
+|---|---|
+| `pr` | `@` review the PR's diff, findings table, no auto-post |
+| `ar` | `@` address unresolved review comments, push, reply |
+| `r`  | `@` rebase on base branch, resolve conflicts, force-push safely |
+| `rs` | `@` analyze failing CI, fix, push, repeat until green |
+| `s`  | `@/simplify` |
+| `pub`| `gh pr ready {url}` (publish draft; runs locally) |
+
+Your **personal configuration** lives in `$HERDR_PLUGIN_STATE_DIR/commands.conf`
+(e.g. `~/.local/state/herdr/plugins/martinv.pr-tracker/commands.conf`). It is
+per-machine **state, not part of the plugin repo** — it is never committed, so
+your machine-specific skills stay yours. An example file is created on first
+run. One `verb = command template` per line; a line with the same verb name
+**overrides the built-in default**; new names add new verbs. Placeholders
+`{url}` `{num}` `{cwd}` are substituted. `r` (refresh) re-reads the file, and
+`?` shows the effective set, tagging each verb `default` or `custom`:
 
 ```conf
-pr  = @/prreview {url}
-ar  = @/pr-comment-response {url}
-pub = gh pr ready {url}
-r   = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
-```
-
-Then `:1pr,2r` reviews PR 1 with your skill and rebases PR 2. Built-in verbs
-win over config; `r` re-reads the file.
-
-Loaded verbs are listed under the board title, and **`?`** shows the full
-help — keys, batch syntax, and every custom verb with its template. A
-`/goal`-driven fix loop works well as a verb too:
-
-```conf
+# override defaults with your own skills
+pr = @/prreview {url}
+ar = @/pr-comment-response {url}
+r  = @/pr-rebase {url}
 rs = @/goal CI on {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green
 ```
 
@@ -87,8 +106,9 @@ retry when idle.
 `r` (your rebase verb), review comments waiting on you or failing CI → `ar`,
 green **draft** → `pub` (publish for review — drafts are never merged),
 green + approved + `ready` → `m`, no review yet → `pr`. Merged/closed PRs are
-skipped. Skill verbs are only suggested when defined in `commands.conf`. Press `Enter` to run the suggested batch,
-any other key to cancel (or type your own with `:`).
+skipped. For rows **without a claude session**, `@` verbs are prefixed with
+`cc` (e.g. `12ccar`) so a workspace + session is spawned first. Press `Enter`
+to run the suggested batch, any other key to cancel (or type your own with `:`).
 
 For a daily routine, run it headless from cron:
 
