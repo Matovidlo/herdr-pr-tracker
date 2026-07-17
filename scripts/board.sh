@@ -176,17 +176,48 @@ action_for() {
     checkout) (cd "${cwd:-.}" && gh pr checkout "$url") ;;
     merge)    (cd "${cwd:-.}" && gh pr merge "$url") ;;   # interactive; uses repo defaults
     plan)     local f="$PLANS_DIR/$(basename "$url").md"; ${EDITOR:-vi} "$f" ;;  # ponytail: pane stdout is a pipe, full-screen editors may warn; good enough
+    cmd:*)    # user-defined verb from commands.conf
+      local tmpl="${CMDS[${verb#cmd:}]:-}"
+      [ -z "$tmpl" ] && return
+      tmpl="${tmpl//\{url\}/$url}"
+      tmpl="${tmpl//\{num\}/${url##*/}}"
+      tmpl="${tmpl//\{cwd\}/$cwd}"
+      (cd "${cwd:-.}" && bash -c "$tmpl") ;;
   esac
 }
 
-# resolve a short verb token to an action_for verb; empty = open
+# user-defined verbs: "<verb> = <command template>" lines in commands.conf.
+# Templates get {url} {num} {cwd} substituted and run in the session's cwd.
+CMDS_FILE="$STATE_DIR/commands.conf"
+declare -A CMDS
+load_cmds() {
+  CMDS=()
+  [ -f "$CMDS_FILE" ] || return 0
+  local verb tmpl
+  while IFS='=' read -r verb tmpl; do
+    verb="${verb//[[:space:]]/}"
+    tmpl="${tmpl#"${tmpl%%[![:space:]]*}"}"   # ltrim
+    [[ "$verb" =~ ^[a-z]+$ ]] && [ -n "$tmpl" ] && CMDS["$verb"]="$tmpl"
+  done < <(grep -v '^[[:space:]]*#' "$CMDS_FILE" 2>/dev/null)
+}
+[ -f "$CMDS_FILE" ] || cat > "$CMDS_FILE" <<'EOF'
+# herdr-pr-tracker custom verbs, used from the ':' command line, e.g. ":1pr,2r".
+# <verb> = <command template>; runs in the PR's session cwd.
+# Placeholders: {url} {num} {cwd}
+# pr = claude -p "/prreview {url}"
+# r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
+EOF
+load_cmds
+
+# resolve a short verb token to an action_for verb; empty = open.
+# Built-ins win; anything else looks up commands.conf (-> "cmd:<verb>").
 resolve_verb() {
   case "$1" in
     ''|o) echo open ;;
     c)    echo checkout ;;
     m)    echo merge ;;
     p)    echo plan ;;
-    *)    return 1 ;;
+    *)    [ -n "${CMDS[$1]:-}" ] && echo "cmd:$1" || return 1 ;;
   esac
 }
 
@@ -224,7 +255,7 @@ while :; do
   while IFS= read -rsn1 -t 10 key; do
     case "$key" in
       q) clear; exit 0 ;;
-      r) URL_CACHE=(); NUMBUF=""; break ;;
+      r) URL_CACHE=(); NUMBUF=""; load_cmds; break ;;
       w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; NUMBUF=""; break ;;
       c) PENDING_VERB="checkout"; NUMBUF=""; printf '\r  [checkout] type row number + Enter … ' ;;
       m) PENDING_VERB="merge";    NUMBUF=""; printf '\r  [merge] type row number + Enter … '    ;;
