@@ -37,17 +37,47 @@ find_pr() {
 SCOPE="all"   # all | ws ('w' toggles); PR rows get numbers 1-9, others are just listed
 
 # fetch one PR's display fields into a cache file (used in parallel)
+# TSV: number, title, ci, merge, review, comment-count
 fetch_pr() {
   local url="$1" out="$2"
-  gh pr view "$url" --json number,title,state,reviewDecision,statusCheckRollup 2>/dev/null \
+  gh pr view "$url" --json number,title,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,comments,reviews 2>/dev/null \
   | jq -r '[(.number // "?"), (.title // ""),
-            ((.state // "?") + (if .reviewDecision then " "+.reviewDecision else "" end)),
             ([.statusCheckRollup[]?.conclusion // .statusCheckRollup[]?.state] | map(select(.!=null))
              | if length==0 then "-"
                elif any(.=="FAILURE" or .=="ERROR" or .=="TIMED_OUT") then "FAIL"
                elif any(.=="PENDING" or .=="IN_PROGRESS" or .=="QUEUED") then "..."
-               else "ok" end)] | @tsv' > "$out" 2>/dev/null
+               else "ok" end),
+            (if .state=="MERGED" then "merged"
+             elif .state=="CLOSED" then "closed"
+             elif .mergeStateStatus=="DIRTY" or .mergeable=="CONFLICTING" then "confl"
+             elif .isDraft then "draft"
+             elif .mergeStateStatus=="BEHIND" then "behind"
+             elif .mergeable=="MERGEABLE" then "ok"
+             elif .mergeable=="UNKNOWN" then "?"
+             else "no" end),
+            (if .reviewDecision=="APPROVED" then "appr"
+             elif .reviewDecision=="CHANGES_REQUESTED" then "me"      # comments to address -> waiting on me
+             elif .reviewDecision=="REVIEW_REQUIRED" then "them"      # waiting on reviewers
+             else "-" end),
+            ((.comments|length) + ([.reviews[]? | select(.body != "")] | length))
+           ] | @tsv' > "$out" 2>/dev/null
 }
+
+# printf %-Ns pads by bytes, not display columns; widen the field by the
+# byte/char surplus so rows with ✓/✗/… still line up.
+pad() {
+  # NB: ${#s} must not sit on the `local s=...` line — it expands before s is
+  # assigned and dies under set -u (same pitfall as in action_for).
+  local s="$1" w="$2" c b
+  c=${#s}
+  b=$(LC_ALL=C; echo "${#s}")
+  printf '%-*s' "$((w + b - c))" "$s"
+}
+
+# symbol maps for the indicator columns
+ci_sym()  { case "$1" in ok) echo "✓";; FAIL) echo "✗";; ...) echo "…";; *) echo "-";; esac; }
+mrg_sym() { case "$1" in ok) echo "✓";; confl) echo "✗confl";; behind) echo "↓behind";; no) echo "✗";; *) echo "$1";; esac; }
+rev_sym() { case "$1" in appr) echo "✓";; me) echo "←me";; them) echo "→them";; *) echo "-";; esac; }
 
 render() {
   local idx=0 hidden=0 agents pane agent status cwd url num title state checks out=""
@@ -101,9 +131,12 @@ render() {
   local line
   for ((idx=1; idx<=n; idx++)); do
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"
-    IFS=$'\t' read -r num title state checks < "$cache/${url//[:\/]/_}" 2>/dev/null || true
-    printf -v line '  %-16.16s %-9s %3s  #%-8s %-7s %.40s\n' \
-      "${R_AGENT[$idx]}" "${R_STATUS[$idx]}" "$idx" "${num:-?}" "${checks:--}" "${title:-}"
+    local mrg rev cmts
+    IFS=$'\t' read -r num title checks mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
+    printf -v line '  %-16.16s %-9s %3s  #%-6s %s %s %s %3s  %.32s\n' \
+      "${R_AGENT[$idx]}" "${R_STATUS[$idx]}" "$idx" "${num:-?}" \
+      "$(pad "$(ci_sym "${checks:--}")" 3)" "$(pad "$(mrg_sym "${mrg:-?}")" 8)" \
+      "$(pad "$(rev_sym "${rev:--}")" 6)" "${cmts:-0}" "${title:-}"
     out+="$line"
   done
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
@@ -112,7 +145,7 @@ render() {
   clear
   printf '\033[1m  Claude PR Tracker\033[0m [%s]  (number+Enter open · r refresh · c checkout · m merge · p plan · w scope · q quit)\n' \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )"
-  printf '  %-16s %-9s %3s  %-9s %-7s %s\n' "AGENT" "STATUS" "N" "PR" "CHECKS" "TITLE"
+  printf '  %-16s %-9s %3s  %-7s %-3s %-8s %-6s %3s  %s\n' "AGENT" "STATUS" "N" "PR" "CI" "MERGE" "REVIEW" "C" "TITLE"
   printf '  %s\n' "------------------------------------------------------------------------------"
   printf '%s' "$out"
 }
