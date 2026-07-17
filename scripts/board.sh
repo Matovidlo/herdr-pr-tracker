@@ -276,6 +276,7 @@ run_batch() {
   IFS=', ' read -ra toks <<<"$1"
   for tok in "${toks[@]}"; do
     [ -z "$tok" ] && continue
+    if [ "$tok" = "?" ] || [ "$tok" = help ]; then show_help; continue; fi
     if [[ "$tok" =~ ^([0-9]+)([a-z]*)$ ]]; then
       n="${BASH_REMATCH[1]}"
       if ! verb="$(resolve_verb "${BASH_REMATCH[2]}")"; then
@@ -301,6 +302,9 @@ suggest_verb() {
     [ -n "${CMDS[r]:-}" ] && { echo r; return; }
     echo c; return ;;   # no rebase verb defined: at least check it out
   esac
+  if [ "$ci" = FAIL ] && [ -n "${CMDS[rs]:-}" ] && [ "$rev" != me ]; then
+    echo rs; return   # failing CI with no review comments to address: fix-CI verb
+  fi
   if [ "$rev" = me ] || [ "$ci" = FAIL ]; then
     [ -n "${CMDS[ar]:-}" ] && echo ar; return
   fi
