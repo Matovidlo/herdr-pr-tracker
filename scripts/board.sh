@@ -130,6 +130,19 @@ render() {
     n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; R_PANE[$n]="$pane"; WANT["$url"]=1
   done
 
+  # pass 1c: your other open authored PRs (no claude session), newest activity
+  # first, appended after the session rows — 'cc' can attach a session to them.
+  if [ "$SCOPE" = all ]; then
+    local u2
+    local -A SEEN=()
+    for ((i=1; i<=n; i++)); do SEEN["${R_URL[$i]}"]=1; done
+    while IFS= read -r u2; do
+      [ -z "$u2" ] && continue
+      [ -n "${SEEN[$u2]:-}" ] && continue
+      n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; WANT["$u2"]=1
+    done < <(gh search prs --author=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' 2>/dev/null)
+  fi
+
   # pass 2: fetch all PR states in parallel, deduped — wall time = one gh call
   local u
   for u in "${!WANT[@]}"; do
@@ -164,7 +177,7 @@ render() {
     "$C_DIM" "$C_RST"
   # surface the loaded custom verbs so ":1pr,2ar" possibilities are discoverable
   if [ ${#CMDS[@]} -gt 0 ]; then
-    printf '  %sverbs: o c m p + %s  (? shows templates)%s\n' "$C_DIM" \
+    printf '  %sverbs: o c m p cc + %s  (? shows templates)%s\n' "$C_DIM" \
       "$(printf '%s\n' "${!CMDS[@]}" | sort | tr '\n' ' ')" "$C_RST"
   else
     printf '  %sno custom verbs — add them to %s (? for help)%s\n' "$C_DIM" "$CMDS_FILE" "$C_RST"
@@ -197,7 +210,7 @@ action_for() {
         # '@' templates are typed INTO the PR's own claude session (visible in
         # its pane, uses its context) instead of running here.
         local pane="${ROW_PANE[$n]:-}" sts="${ROW_STATUS[$n]:-}"
-        [ -z "$pane" ] && { printf '  row %s: no pane to send to\n' "$n"; return; }
+        [ -z "$pane" ] && { printf '  row %s: no claude session — use ":%scc%s" to spawn one\n' "$n" "$n" "${verb#cmd:}"; return; }
         if [ "$sts" = working ]; then
           printf '  row %s: session is busy (working) — skipped, retry when idle\n' "$n"; return
         fi
@@ -207,17 +220,71 @@ action_for() {
       else
         (cd "${cwd:-.}" && bash -c "$tmpl")
       fi ;;
+    spawn:*)  spawn_cc "$n" "${verb#spawn:}" ;;
   esac
+}
+
+# 'cc' verb: attach a fresh claude session to a PR in its own herdr workspace.
+# Clones the repo into a per-PR checkout dir (reused on later calls), checks
+# out the PR branch, spawns workspace + claude, and optionally types a
+# follow-up verb's template into the new session (":10ccar").
+spawn_cc() {
+  local n="$1" follow="$2"
+  local url="${ROW_URL[$n]:-}" num repo dir out wsid pane
+  [ -z "$url" ] && return
+  num="${url##*/}"
+  repo="${url#https://github.com/}"; repo="${repo%%/pull/*}"
+  # ponytail: full clone per PR — simple and isolated; switch to shared clone
+  # + worktrees if big repos make this too slow
+  dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num"
+  if [ ! -d "$dir/.git" ]; then
+    printf '  row %s: cloning %s … ' "$n" "$repo"
+    gh repo clone "$repo" "$dir" -- --quiet >/dev/null 2>&1 || { printf 'clone failed\n'; return; }
+    printf 'ok\n'
+  fi
+  (cd "$dir" && gh pr checkout "$url" >/dev/null 2>&1) || { printf '  row %s: gh pr checkout failed in %s\n' "$n" "$dir"; return; }
+  out="$("$HERDR" workspace create --cwd "$dir" --label "PR #$num" --no-focus 2>/dev/null)"
+  wsid="$(jq -r '.result.workspace.workspace_id // empty' <<<"$out" 2>/dev/null)"
+  [ -z "$wsid" ] && { printf '  row %s: workspace create failed\n' "$n"; return; }
+  out="$("$HERDR" agent start claude --workspace "$wsid" --cwd "$dir" --focus -- claude 2>/dev/null)"
+  pane="$(jq -r '.result.agent.pane_id // empty' <<<"$out" 2>/dev/null)"
+  printf '  row %s: claude started in workspace %s (%s)\n' "$n" "$wsid" "$dir"
+  [ -z "$follow" ] && return
+  local tmpl="${CMDS[$follow]:-}"
+  tmpl="${tmpl//\{url\}/$url}"
+  tmpl="${tmpl//\{num\}/$num}"
+  tmpl="${tmpl//\{cwd\}/$dir}"
+  if [[ "$tmpl" == @* ]]; then
+    [ -z "$pane" ] && { printf '  row %s: no pane id — run "%s" manually\n' "$n" "$follow"; return; }
+    # let claude boot before typing the prompt
+    "$HERDR" agent wait "$pane" --status idle --timeout 90000 >/dev/null 2>&1
+    "$HERDR" pane run "$pane" "${tmpl#@}" >/dev/null 2>&1 \
+      && printf '  row %s: sent %s to the new session\n' "$n" "$follow" \
+      || printf '  row %s: failed to send %s\n' "$n" "$follow"
+  else
+    (cd "$dir" && bash -c "$tmpl")
+  fi
 }
 
 # user-defined verbs: "<verb> = <command template>" lines in commands.conf.
 # Templates get {url} {num} {cwd} substituted and run in the session's cwd.
 CMDS_FILE="$STATE_DIR/commands.conf"
 declare -A CMDS
+# Built-in default verbs — generic, no personal skills required. Any line in
+# commands.conf with the same verb name overrides the default.
+declare -A DEFAULT_CMDS=(
+  [pr]='@Review PR {url}: review only the changed code (the diff), rank findings by severity with exact file:line, be concrete about fixes, and present a findings table — do not post to GitHub without approval.'
+  [ar]='@Address the review comments on PR {url}: read all unresolved review and bot comments, implement the fixes, push, and reply to each comment.'
+  [r]='@Rebase PR {url} on its base branch, resolve any conflicts, and push with --force-with-lease.'
+  [rs]='@CI on PR {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green.'
+  [s]='@/simplify'
+  [pub]='gh pr ready {url}'
+)
 load_cmds() {
   CMDS=()
+  local v verb tmpl
+  for v in "${!DEFAULT_CMDS[@]}"; do CMDS["$v"]="${DEFAULT_CMDS[$v]}"; done
   [ -f "$CMDS_FILE" ] || return 0
-  local verb tmpl
   while IFS='=' read -r verb tmpl; do
     verb="${verb//[[:space:]]/}"
     tmpl="${tmpl#"${tmpl%%[![:space:]]*}"}"   # ltrim
@@ -226,15 +293,18 @@ load_cmds() {
 }
 [ -f "$CMDS_FILE" ] || cat > "$CMDS_FILE" <<'EOF'
 # herdr-pr-tracker custom verbs, used from the ':' command line, e.g. ":1pr,2r".
+# This file is per-machine state (never part of the plugin repo). Defaults for
+# pr/ar/r/rs/s/pub are built into the plugin; a line here with the same verb
+# name overrides the default. '?' on the board lists the effective set.
+#
 # <verb> = <command template>; runs in the PR's session cwd.
 # Prefix the template with '@' to type it into the PR's own claude session
 # instead (skipped while that session is working).
 # Placeholders: {url} {num} {cwd}
 # pr  = @/prreview {url}
 # ar  = @/pr-comment-response {url}
-# pub = gh pr ready {url}
-# r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
-# rs = @/goal CI on {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green
+# r   = @/pr-rebase {url}
+# rs  = @/goal CI on {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green
 EOF
 load_cmds
 
@@ -242,16 +312,14 @@ load_cmds
 show_help() {
   printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p then <n>+Enter checkout/merge/plan · : batch · t triage · r refresh · w scope · q quit\n' "$C_BLD" "$C_RST"
   printf '%s  batch%s     :<row><verb>[,<row><verb>…]  e.g. ":1pr,2m,3r,4ar" — no verb = open, so ":1,2" opens two tabs\n' "$C_BLD" "$C_RST"
-  printf '%s  built-in%s  o open · c checkout · m merge · p plan\n' "$C_BLD" "$C_RST"
-  if [ ${#CMDS[@]} -gt 0 ]; then
-    printf '%s  custom%s    from %s ('"'"'@'"'"' = typed into the PR'"'"'s claude session):\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
-    local v
-    while IFS= read -r v; do
-      printf '    %-5s = %s\n' "$v" "${CMDS[$v]}"
-    done < <(printf '%s\n' "${!CMDS[@]}" | sort)
-  else
-    printf '%s  custom%s    none yet — add "verb = template" lines to %s\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
-  fi
+  printf '%s  built-in%s  o open · c checkout · m merge · p plan · cc new workspace+claude on the PR (combine: ":10ccar" = cc, then run ar there)\n' "$C_BLD" "$C_RST"
+  printf '%s  verbs%s     '"'"'@'"'"' = typed into the PR'"'"'s claude session · override defaults in %s:\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
+  local v tag
+  while IFS= read -r v; do
+    tag="custom "
+    [ "${DEFAULT_CMDS[$v]:-}" = "${CMDS[$v]}" ] && tag="default"
+    printf '    %-5s %s%s%s = %s\n' "$v" "$C_DIM" "$tag" "$C_RST" "${CMDS[$v]}"
+  done < <(printf '%s\n' "${!CMDS[@]}" | sort)
   printf '\n  press any key to return '
   IFS= read -rsn1 -t 60 _ || true
 }
@@ -264,6 +332,9 @@ resolve_verb() {
     c)    echo checkout ;;
     m)    echo merge ;;
     p)    echo plan ;;
+    cc*)  # spawn a fresh workspace+claude for the PR; optional follow-up verb ("ccar")
+      local f="${1#cc}"
+      if [ -z "$f" ] || [ -n "${CMDS[$f]:-}" ]; then echo "spawn:$f"; else return 1; fi ;;
     *)    [ -n "${CMDS[$1]:-}" ] && echo "cmd:$1" || return 1 ;;
   esac
 }
@@ -329,6 +400,8 @@ triage() {
     url="${ROW_URL[$idx]:-}"; [ -z "$url" ] && continue
     IFS=$'\t' read -r num title ci st mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
     verb="$(suggest_verb "${ci:--}" "${st:-?}" "${mrg:-?}" "${rev:--}")"
+    # session-less row + session-bound verb: suggest spawning a session first
+    if [ -n "$verb" ] && [ -z "${ROW_PANE[$idx]:-}" ] && [[ "${CMDS[$verb]:-}" == @* ]]; then verb="cc$verb"; fi
     why=""
     case "$st" in merged|closed) why="" ;; *)
       [ "$mrg" = confl ]  && why="conflicts — rebase needed"
