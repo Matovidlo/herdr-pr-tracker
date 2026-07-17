@@ -8,7 +8,8 @@ recent output for a `…/pull/N` URL, falling back to `gh pr list --head <branch
 and renders a board with per-PR indicators:
 
 - **CI** — `✓` passing / `✗` failing / `…` running / `-` none
-- **MERGE** — `✓` mergeable · `✗confl` conflicts (rebase needed) · `↓behind` behind base · `draft` · `merged`/`closed`
+- **ST** — PR lifecycle: `draft` · `ready` (published for review) · `merged` · `closed`
+- **MERGE** — pure mergeability, independent of draft-ness: `✓` mergeable · `✗confl` conflicts (rebase needed) · `↓behind` behind base
 - **REVIEW** — `←me` changes requested (waiting on you) · `→them` review requested (waiting on reviewers) · `✓` approved
 - **C** — comment count (issue comments + review comments)
 
@@ -58,9 +59,10 @@ is created on first run). One `verb = command template` per line; placeholders
 session working directory:
 
 ```conf
-pr = @/prreview {url}
-ar = @/pr-comment-response {url}
-r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
+pr  = @/prreview {url}
+ar  = @/pr-comment-response {url}
+pub = gh pr ready {url}
+r   = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
 ```
 
 Then `:1pr,2r` reviews PR 1 with your skill and rebases PR 2. Built-in verbs
@@ -75,8 +77,9 @@ retry when idle.
 ### Triage
 `t` inspects every row's indicators and suggests one batch: conflicts/behind →
 `r` (your rebase verb), review comments waiting on you or failing CI → `ar`,
-green + approved → `m`, no review yet → `pr`. Skill verbs are only suggested
-when defined in `commands.conf`. Press `Enter` to run the suggested batch,
+green **draft** → `pub` (publish for review — drafts are never merged),
+green + approved + `ready` → `m`, no review yet → `pr`. Merged/closed PRs are
+skipped. Skill verbs are only suggested when defined in `commands.conf`. Press `Enter` to run the suggested batch,
 any other key to cancel (or type your own with `:`).
 
 For a daily routine, run it headless from cron:

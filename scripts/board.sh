@@ -37,7 +37,7 @@ find_pr() {
 SCOPE="all"   # all | ws ('w' toggles); PR rows get numbers 1-9, others are just listed
 
 # fetch one PR's display fields into a cache file (used in parallel)
-# TSV: number, title, ci, merge, review, comment-count
+# TSV: number, title, ci, pr-state, merge, review, comment-count
 fetch_pr() {
   local url="$1" out="$2"
   gh pr view "$url" --json number,title,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,comments,reviews 2>/dev/null \
@@ -47,10 +47,11 @@ fetch_pr() {
                elif any(.=="FAILURE" or .=="ERROR" or .=="TIMED_OUT") then "FAIL"
                elif any(.=="PENDING" or .=="IN_PROGRESS" or .=="QUEUED") then "..."
                else "ok" end),
-            (if .state=="MERGED" then "merged"
+            (if .state=="MERGED" then "merged"      # PR lifecycle: draft vs published for review
              elif .state=="CLOSED" then "closed"
-             elif .mergeStateStatus=="DIRTY" or .mergeable=="CONFLICTING" then "confl"
              elif .isDraft then "draft"
+             else "ready" end),
+            (if .mergeStateStatus=="DIRTY" or .mergeable=="CONFLICTING" then "confl"   # pure mergeability, independent of draft-ness
              elif .mergeStateStatus=="BEHIND" then "behind"
              elif .mergeable=="MERGEABLE" then "ok"
              elif .mergeable=="UNKNOWN" then "?"
@@ -84,7 +85,8 @@ rev_sym() { case "$1" in appr) echo "✓";; me) echo "←me";; them) echo "→th
 C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YEL=$'\033[33m' C_MAG=$'\033[35m'
 C_CYN=$'\033[36m' C_DIM=$'\033[2m'  C_BLD=$'\033[1m'  C_RST=$'\033[0m'
 ci_col()  { case "$1" in ok) printf %s "$C_GRN";; FAIL) printf %s "$C_RED";; ...) printf %s "$C_YEL";; esac; }
-mrg_col() { case "$1" in ok) printf %s "$C_GRN";; confl|no) printf %s "$C_RED";; behind) printf %s "$C_YEL";; merged) printf %s "$C_MAG";; draft|closed) printf %s "$C_DIM";; esac; }
+mrg_col() { case "$1" in ok) printf %s "$C_GRN";; confl|no) printf %s "$C_RED";; behind) printf %s "$C_YEL";; esac; }
+st_col()  { case "$1" in ready) printf %s "$C_GRN";; draft) printf %s "$C_YEL";; merged) printf %s "$C_MAG";; closed) printf %s "$C_DIM";; esac; }
 rev_col() { case "$1" in appr) printf %s "$C_GRN";; me) printf %s "$C_RED";; them) printf %s "$C_YEL";; esac; }
 sts_col() { case "$1" in working) printf %s "$C_GRN";; blocked) printf %s "$C_RED";; idle|done) printf %s "$C_DIM";; esac; }
 
@@ -140,11 +142,12 @@ render() {
   local line
   for ((idx=1; idx<=n; idx++)); do
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"
-    local mrg rev cmts
-    IFS=$'\t' read -r num title checks mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
-    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %s%s%s %s%s%s %s%s%s %3s  %.32s\n' \
+    local st mrg rev cmts
+    IFS=$'\t' read -r num title checks st mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
+    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %s%s%s %s%-6s%s %s%s%s %s%s%s %3s  %.32s\n' \
       "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" \
       "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
+      "$(st_col "${st:-?}")"      "${st:-?}"                             "$C_RST" \
       "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
       "$(rev_col "${rev:--}")"    "$(pad "$(rev_sym "${rev:--}")" 6)"    "$C_RST" \
       "${cmts:-0}" "${title:-}"
@@ -159,7 +162,7 @@ render() {
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
-  printf '%s  %-16s %-9s %3s  %-7s %-3s %-8s %-6s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "CI" "MERGE" "REVIEW" "C" "TITLE" "$C_RST"
+  printf '%s  %-16s %-9s %3s  %-7s %-3s %-6s %-8s %-6s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "CI" "ST" "MERGE" "REVIEW" "C" "TITLE" "$C_RST"
   printf '  %s%s%s\n' "$C_DIM" "------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
 }
@@ -220,8 +223,9 @@ load_cmds() {
 # Prefix the template with '@' to type it into the PR's own claude session
 # instead (skipped while that session is working).
 # Placeholders: {url} {num} {cwd}
-# pr = @/prreview {url}
-# ar = @/pr-comment-response {url}
+# pr  = @/prreview {url}
+# ar  = @/pr-comment-response {url}
+# pub = gh pr ready {url}
 # r  = gh pr checkout {url} && git fetch origin master && git rebase origin/master && git push --force-with-lease
 EOF
 load_cmds
@@ -265,7 +269,8 @@ run_batch() {
 # map one row's indicators to a suggested verb; empty = nothing for you to do.
 # Skill verbs are only suggested when defined in commands.conf.
 suggest_verb() {
-  local ci="$1" mrg="$2" rev="$3"
+  local ci="$1" st="$2" mrg="$3" rev="$4"
+  case "$st" in merged|closed) return ;; esac   # done — nothing to suggest
   case "$mrg" in confl|behind)
     [ -n "${CMDS[r]:-}" ] && { echo r; return; }
     echo c; return ;;   # no rebase verb defined: at least check it out
@@ -273,8 +278,12 @@ suggest_verb() {
   if [ "$rev" = me ] || [ "$ci" = FAIL ]; then
     [ -n "${CMDS[ar]:-}" ] && echo ar; return
   fi
-  if [ "$mrg" = ok ] && [ "$rev" = appr ] && [ "$ci" != FAIL ] && [ "$ci" != "..." ]; then
-    echo m; return
+  if [ "$mrg" = ok ] && [ "$ci" != FAIL ] && [ "$ci" != "..." ]; then
+    # green draft: suggest a publish verb (e.g. pub = gh pr ready {url}); never merge a draft
+    if [ "$st" = draft ]; then
+      [ -n "${CMDS[pub]:-}" ] && echo pub; return
+    fi
+    [ "$rev" = appr ] && { echo m; return; }
   fi
   [ "$rev" = "-" ] && [ -n "${CMDS[pr]:-}" ] && echo pr
 }
@@ -284,19 +293,22 @@ suggest_verb() {
 TRIAGE_BATCH=""
 triage() {
   TRIAGE_BATCH=""
-  local idx url num title ci mrg rev cmts verb why cache="$STATE_DIR/prcache"
+  local idx url num title ci st mrg rev cmts verb why cache="$STATE_DIR/prcache"
   printf '\n%s  triage:%s\n' "$C_BLD" "$C_RST"
   for ((idx=1; idx<=${#ROW_URL[@]}; idx++)); do
     url="${ROW_URL[$idx]:-}"; [ -z "$url" ] && continue
-    IFS=$'\t' read -r num title ci mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
-    verb="$(suggest_verb "${ci:--}" "${mrg:-?}" "${rev:--}")"
+    IFS=$'\t' read -r num title ci st mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
+    verb="$(suggest_verb "${ci:--}" "${st:-?}" "${mrg:-?}" "${rev:--}")"
     why=""
-    [ "$mrg" = confl ]  && why="conflicts — rebase needed"
-    [ "$mrg" = behind ] && why="behind base — rebase/update"
-    [ -z "$why" ] && [ "$rev" = me ] && why="review comments waiting on you"
-    [ -z "$why" ] && [ "$ci" = FAIL ] && why="CI failing"
-    [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = m ] && why="green and approved — mergeable"
-    [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = pr ] && why="no review yet — run your review skill"
+    case "$st" in merged|closed) why="" ;; *)
+      [ "$mrg" = confl ]  && why="conflicts — rebase needed"
+      [ "$mrg" = behind ] && why="behind base — rebase/update"
+      [ -z "$why" ] && [ "$rev" = me ] && why="review comments waiting on you"
+      [ -z "$why" ] && [ "$ci" = FAIL ] && why="CI failing"
+      [ -z "$why" ] && [ "$st" = draft ] && [ "$mrg" = ok ] && why="green draft — publish for review"
+      [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = m ] && why="green and approved — mergeable"
+      [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = pr ] && why="no review yet — run your review skill" ;;
+    esac
     if [ -n "$verb" ]; then
       printf '  %s%d%s%s  #%-6s %s\n' "$C_YEL" "$idx" "$verb" "$C_RST" "${num:-?}" "$why"
       TRIAGE_BATCH+="${TRIAGE_BATCH:+,}$idx$verb"
