@@ -39,7 +39,8 @@ description = "open PR tracker board"
 
 ## Board keys
 Type a row number + `Enter` to open that PR in the browser · `c`/`m`/`p` then
-number + `Enter` = checkout / merge / edit plan note · `r` full refresh ·
+number + `Enter` = checkout / merge / edit plan note · `t` triage ·
+`d` dependabot/security sweep · `r` full refresh ·
 `w` toggle current-workspace-only ⇄ all sessions · `q` quit.
 
 `:` opens a **command line** for batch actions — comma-separated
@@ -56,8 +57,8 @@ open browser tabs, so `1,2` opens two PRs at once.
 Besides the PRs of running claude sessions, the board can append **every open
 PR you authored or are assigned to** (via `gh search prs --author=@me` +
 `--assignee=@me`, deduped — assigned dependabot PRs show up too), sorted by
-latest update, with `-` in the AGENT/STATUS columns. Use `cc` to attach a
-session to one.
+latest update, with `-` in the AGENT/STATUS columns and the repo in the REPO
+column. Use `cc` to attach a session to one.
 
 This is **disabled by default** (sessions-only board). Enable it per machine
 by touching `show-authored` in the plugin's state dir — under herdr that is
@@ -90,6 +91,7 @@ no personal skills required):
 | `rs` | `@` analyze failing CI, fix, push, repeat until green |
 | `s`  | `@/simplify` |
 | `pub`| `gh pr ready {url}` (publish draft; runs locally) |
+| `dep`| `@` wrap up dependabot + security compliance for `{repo}`: merge/combine safe bumps, fix critical/high alerts, report the rest |
 
 Your **personal configuration** lives in `$HERDR_PLUGIN_STATE_DIR/commands.conf`
 (e.g. `~/.local/state/herdr/plugins/martinv.pr-tracker/commands.conf`). It is
@@ -97,7 +99,7 @@ per-machine **state, not part of the plugin repo** — it is never committed, so
 your machine-specific skills stay yours. An example file is created on first
 run. One `verb = command template` per line; a line with the same verb name
 **overrides the built-in default**; new names add new verbs. Placeholders
-`{url}` `{num}` `{cwd}` are substituted. `r` (refresh) re-reads the file, and
+`{url}` `{num}` `{cwd}` `{repo}` (owner/name) are substituted. `r` (refresh) re-reads the file, and
 `?` shows the effective set, tagging each verb `default` or `custom`:
 
 ```conf
@@ -123,6 +125,26 @@ skipped. For rows **without a claude session**, `@` verbs are prefixed with
 `cc` (e.g. `12ccar`) so a workspace + session is spawned first. Press `Enter`
 to run the suggested batch, any other key to cancel (or type your own with `:`).
 
+### Dependabot / security sweep (`d`)
+`d` scans every **distinct repo** on the board **plus every repo you
+contributed to** (repos of your 50 most recent authored or assigned PRs, any
+state) — repo-level hygiene, kept separate from per-PR triage on purpose —
+and prints, per repo: open dependabot
+PR count, open dependabot alert count, and a **critical/high severity
+breakdown** — repos with criticals in red, others in yellow. Clean repos are
+hidden behind a `(N clean repo(s) hidden)` footer. Alert counts need a `gh`
+token with the `security_events` scope; `?` is shown otherwise.
+
+Contributed-to repos without a PR on the board are listed informationally
+(no `dep` token — the verb needs a board row to target).
+
+Flagged repos assemble a batch like `3dep,7dep` (one row per repo): press
+`Enter` to wrap them all up — each repo gets the `dep` verb typed into its
+claude session (spawn one first with `cc` if the row has none) — or cancel and
+address a single repo with `:3dep`. Override `dep` in `commands.conf` to use
+your own skill; the built-in prompt needs none.
+
+### Headless triage
 For a daily routine, run it headless from cron:
 
 ```cron
