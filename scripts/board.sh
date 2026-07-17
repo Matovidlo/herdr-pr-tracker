@@ -261,7 +261,7 @@ action_for() {
 # follow-up verb's template into the new session (":10ccar").
 spawn_cc() {
   local n="$1" follow="$2"
-  local url="${ROW_URL[$n]:-}" num repo dir out wsid pane
+  local url="${ROW_URL[$n]:-}" num repo dir out wsid pane root
   [ -z "$url" ] && return
   num="${url##*/}"
   repo="${url#https://github.com/}"; repo="${repo%%/pull/*}"
@@ -276,9 +276,20 @@ spawn_cc() {
   (cd "$dir" && gh pr checkout "$url" >/dev/null 2>&1) || { printf '  row %s: gh pr checkout failed in %s\n' "$n" "$dir"; return; }
   out="$("$HERDR" workspace create --cwd "$dir" --label "PR #$num" --no-focus 2>/dev/null)"
   wsid="$(jq -r '.result.workspace.workspace_id // empty' <<<"$out" 2>/dev/null)"
+  root="$(jq -r '.result.root_pane.pane_id // empty' <<<"$out" 2>/dev/null)"
   [ -z "$wsid" ] && { printf '  row %s: workspace create failed\n' "$n"; return; }
-  out="$("$HERDR" agent start claude --workspace "$wsid" --cwd "$dir" --focus -- claude 2>/dev/null)"
+  # agent names are unique server-wide — a second cc with the name "claude"
+  # would die with agent_name_taken, so key the name to the workspace
+  out="$("$HERDR" agent start "claude-$wsid" --workspace "$wsid" --cwd "$dir" --focus -- claude 2>/dev/null)"
   pane="$(jq -r '.result.agent.pane_id // empty' <<<"$out" 2>/dev/null)"
+  if [ -z "$pane" ]; then
+    printf '  row %s: agent start failed: %s\n' "$n" "$(jq -r '.error.message // "unknown error"' <<<"$out" 2>/dev/null)"
+    "$HERDR" workspace close "$wsid" >/dev/null 2>&1
+    return
+  fi
+  # workspace create spawns a root shell pane and agent start adds its own,
+  # leaving a 2-pane split — close the shell so only the claude pane remains
+  [ -n "$root" ] && "$HERDR" pane close "$root" >/dev/null 2>&1
   printf '  row %s: claude started in workspace %s (%s)\n' "$n" "$wsid" "$dir"
   [ -z "$follow" ] && return
   local tmpl="${CMDS[$follow]:-}"
