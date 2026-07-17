@@ -68,6 +68,14 @@ r   = gh pr checkout {url} && git fetch origin master && git rebase origin/maste
 Then `:1pr,2r` reviews PR 1 with your skill and rebases PR 2. Built-in verbs
 win over config; `r` re-reads the file.
 
+Loaded verbs are listed under the board title, and **`?`** shows the full
+help — keys, batch syntax, and every custom verb with its template. A
+`/goal`-driven fix loop works well as a verb too:
+
+```conf
+rs = @/goal CI on {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green
+```
+
 Templates starting with **`@`** are not run locally — the text after `@` is
 typed **into the claude session that owns the PR** (via `herdr pane run`), so
 skills execute with that session's context, visibly in its pane. Sessions with
