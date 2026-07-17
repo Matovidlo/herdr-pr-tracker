@@ -179,6 +179,10 @@ render() {
     if [ "${R_KIND[$idx]:-}" = rev ] && [ "${R_KIND[$((idx-1))]:-}" != rev ]; then
       out+="  ${C_DIM}— waiting for your review (cr review · fin take over) —${C_RST}"$'\n'
     fi
+    # ...and when it ends: your authored/assigned PRs are NOT waiting for your review
+    if [ "${R_KIND[$idx]:-}" = mine ] && [ "${R_KIND[$((idx-1))]:-}" != mine ]; then
+      out+="  ${C_DIM}— your other open PRs —${C_RST}"$'\n'
+    fi
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"; ROW_KIND[$idx]="${R_KIND[$idx]:-}"
     local st mrg rev cmts author reviewers rname revd
     IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers < "$cache/${url//[:\/]/_}" 2>/dev/null || true
