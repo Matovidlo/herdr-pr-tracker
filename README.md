@@ -53,6 +53,21 @@ number + `Enter` = checkout / merge / edit plan note · `t` triage ·
 Verbs: *(none)*/`o` open · `c` checkout · `m` merge · `p` plan. Plain numbers
 open browser tabs, so `1,2` opens two PRs at once.
 
+### PRs waiting for your review
+In `all sessions` scope the board appends every open PR where **your review is
+requested** (`gh search prs --review-requested=@me`), right after the session
+rows under a `— waiting for your review —` separator. Two verbs target them:
+
+- `cr` — **conduct the code review** (the usual case): findings table with
+  file:line, ranked by severity, never posted to GitHub without approval.
+- `fin` — **take the PR over** when the author is away: address the open
+  review comments, fix CI, rebase, push until it's ready to merge.
+
+Both are `@` verbs, so on these session-less rows combine with `cc`:
+`:5cccr` spawns a workspace + claude on the PR and starts the review.
+Override either in `commands.conf` to use your own review skill, e.g.
+`cr = @/thermo-nuclear-code-quality-review {url}`.
+
 ### Rows without a session (your authored/assigned PRs) — opt-in
 Besides the PRs of running claude sessions, the board can append **every open
 PR you authored or are assigned to** (via `gh search prs --author=@me` +
@@ -91,6 +106,8 @@ no personal skills required):
 | `rs` | `@` analyze failing CI, fix, push, repeat until green |
 | `s`  | `@/simplify` |
 | `pub`| `gh pr ready {url}` (publish draft; runs locally) |
+| `cr` | `@` conduct a code review as the requested reviewer, findings table, no auto-post |
+| `fin`| `@` take over a colleague's PR: address comments, fix CI, push until ready |
 | `dep`| `@` wrap up dependabot + security compliance for `{repo}`: merge/combine safe bumps, fix critical/high alerts, report the rest |
 
 Your **personal configuration** lives in `$HERDR_PLUGIN_STATE_DIR/commands.conf`
@@ -120,7 +137,9 @@ retry when idle.
 `t` inspects every row's indicators and suggests one batch: conflicts/behind →
 `r` (your rebase verb), review comments waiting on you or failing CI → `ar`,
 green **draft** → `pub` (publish for review — drafts are never merged),
-green + approved + `ready` → `m`, no review yet → `pr`. Merged/closed PRs are
+green + approved + `ready` → `m`, no review yet → `pr`, **waiting for your
+review** → `cr` (with a hint that `:Nfin` takes the PR over instead — triage
+never suggests rewriting a colleague's PR on its own). Merged/closed PRs are
 skipped. For rows **without a claude session**, `@` verbs are prefixed with
 `cc` (e.g. `12ccar`) so a workspace + session is spawned first. Press `Enter`
 to run the suggested batch, any other key to cancel (or type your own with `:`).

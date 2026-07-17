@@ -15,7 +15,7 @@ for bin in gh jq; do
 done
 
 # rows[] is filled each cycle: "pane_id<TAB>agent<TAB>status<TAB>branch<TAB>pr_url"
-declare -a ROW_URL ROW_CWD ROW_PANE ROW_STATUS
+declare -a ROW_URL ROW_CWD ROW_PANE ROW_STATUS ROW_KIND
 # pane_id -> PR url; scraping pane scrollback is the slowest step, do it once
 # per pane and only rediscover on explicit refresh ('r').
 declare -A URL_CACHE
@@ -116,7 +116,7 @@ render() {
   done <<<"$agents"
   wait
   # pass 1b: fold discoveries into the cache, build rows
-  local -a R_AGENT=() R_STATUS=() R_URL=() R_CWD=() R_PANE=()
+  local -a R_AGENT=() R_STATUS=() R_URL=() R_CWD=() R_PANE=() R_KIND=()
   local -A WANT=()
   local n=0
   for ((i=1; i<=m; i++)); do
@@ -127,22 +127,35 @@ render() {
       URL_CACHE[$pane]="${url:--}"
     fi
     if [ "$url" = "-" ] || [ -z "$url" ]; then hidden=$((hidden+1)); continue; fi
-    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; R_PANE[$n]="$pane"; WANT["$url"]=1
+    n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; R_PANE[$n]="$pane"; R_KIND[$n]="sess"; WANT["$url"]=1
   done
 
-  # pass 1c: your other open PRs (no claude session) — authored by you or
-  # assigned to you — newest activity first, appended after the session rows;
-  # 'cc' can attach a session to them.
-  # Opt-in per machine: touch "$STATE_DIR/show-authored" to enable.
-  if [ "$SCOPE" = all ] && [ -f "$STATE_DIR/show-authored" ]; then
-    local u2
-    local -A SEEN=()
-    for ((i=1; i<=n; i++)); do SEEN["${R_URL[$i]}"]=1; done
+  local u2
+  local -A SEEN=()
+  for ((i=1; i<=n; i++)); do SEEN["${R_URL[$i]}"]=1; done
+
+  # pass 1c: PRs waiting for YOUR review (review requested from you) — shown
+  # right after the session rows, before your other PRs. 'cr' conducts the
+  # review; 'fin' takes the PR over when the author is away.
+  if [ "$SCOPE" = all ]; then
     while IFS= read -r u2; do
       [ -z "$u2" ] && continue
       [ -n "${SEEN[$u2]:-}" ] && continue
       SEEN["$u2"]=1
-      n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; WANT["$u2"]=1
+      n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; R_KIND[$n]="rev"; WANT["$u2"]=1
+    done < <(gh search prs --review-requested=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' 2>/dev/null)
+  fi
+
+  # pass 1d: your other open PRs (no claude session) — authored by you or
+  # assigned to you — newest activity first, appended after the session rows;
+  # 'cc' can attach a session to them.
+  # Opt-in per machine: touch "$STATE_DIR/show-authored" to enable.
+  if [ "$SCOPE" = all ] && [ -f "$STATE_DIR/show-authored" ]; then
+    while IFS= read -r u2; do
+      [ -z "$u2" ] && continue
+      [ -n "${SEEN[$u2]:-}" ] && continue
+      SEEN["$u2"]=1
+      n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; R_KIND[$n]="mine"; WANT["$u2"]=1
     done < <({ gh search prs --author=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'
                gh search prs --assignee=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'; } 2>/dev/null)
   fi
@@ -155,10 +168,14 @@ render() {
   wait
 
   # pass 3: assemble off-screen, then draw in one shot (no flicker)
-  ROW_URL=(); ROW_CWD=(); ROW_PANE=(); ROW_STATUS=()
+  ROW_URL=(); ROW_CWD=(); ROW_PANE=(); ROW_STATUS=(); ROW_KIND=()
   local line
   for ((idx=1; idx<=n; idx++)); do
-    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"
+    # section separator when entering the review-requested block
+    if [ "${R_KIND[$idx]:-}" = rev ] && [ "${R_KIND[$((idx-1))]:-}" != rev ]; then
+      out+="  ${C_DIM}— waiting for your review (cr review · fin take over) —${C_RST}"$'\n'
+    fi
+    url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"; ROW_KIND[$idx]="${R_KIND[$idx]:-}"
     local st mrg rev cmts rname
     IFS=$'\t' read -r num title checks st mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
     rname="${url#https://github.com/}"; rname="${rname#*/}"; rname="${rname%%/pull/*}"
@@ -287,6 +304,8 @@ declare -A DEFAULT_CMDS=(
   [rs]='@CI on PR {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green.'
   [s]='@/simplify'
   [pub]='gh pr ready {url}'
+  [cr]='@Conduct a code review of PR {url} as the requested reviewer: study the full diff, check correctness, tests, and maintainability, rank findings by severity with exact file:line, and present a findings table — do not submit the review to GitHub without approval.'
+  [fin]='@Take over PR {url} and finish it: read the discussion and unresolved review comments, address them, fix any failing CI, rebase on the base branch if needed, and push until the PR is green and ready to merge.'
   [dep]='@Wrap up dependabot and security compliance for {repo}: list all open dependabot PRs and open dependabot alerts (critical/high first), merge or combine the safe bumps, fix what the alerts require, and report anything that needs manual attention.'
 )
 load_cmds() {
@@ -376,8 +395,14 @@ run_batch() {
 # map one row's indicators to a suggested verb; empty = nothing for you to do.
 # Skill verbs are only suggested when defined in commands.conf.
 suggest_verb() {
-  local ci="$1" st="$2" mrg="$3" rev="$4"
+  local ci="$1" st="$2" mrg="$3" rev="$4" kind="${5:-}"
   case "$st" in merged|closed) return ;; esac   # done — nothing to suggest
+  if [ "$kind" = rev ]; then
+    # someone else's PR waiting on you: conduct the review ('fin' to take it
+    # over instead is a manual call — never suggest rewriting a colleague's PR)
+    [ -n "${CMDS[cr]:-}" ] && echo cr
+    return
+  fi
   case "$mrg" in confl|behind)
     [ -n "${CMDS[r]:-}" ] && { echo r; return; }
     echo c; return ;;   # no rebase verb defined: at least check it out
@@ -459,10 +484,13 @@ triage() {
   for ((idx=1; idx<=${#ROW_URL[@]}; idx++)); do
     url="${ROW_URL[$idx]:-}"; [ -z "$url" ] && continue
     IFS=$'\t' read -r num title ci st mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
-    verb="$(suggest_verb "${ci:--}" "${st:-?}" "${mrg:-?}" "${rev:--}")"
+    verb="$(suggest_verb "${ci:--}" "${st:-?}" "${mrg:-?}" "${rev:--}" "${ROW_KIND[$idx]:-}")"
     # session-less row + session-bound verb: suggest spawning a session first
     if [ -n "$verb" ] && [ -z "${ROW_PANE[$idx]:-}" ] && [[ "${CMDS[$verb]:-}" == @* ]]; then verb="cc$verb"; fi
     why=""
+    if [ "${ROW_KIND[$idx]:-}" = rev ] && [ "$st" != merged ] && [ "$st" != closed ]; then
+      why="waiting for your review — conduct CR (\":${idx}fin\" takes it over if the author is away)"
+    else
     case "$st" in merged|closed) why="" ;; *)
       [ "$mrg" = confl ]  && why="conflicts — rebase needed"
       [ "$mrg" = behind ] && why="behind base — rebase/update"
@@ -472,6 +500,7 @@ triage() {
       [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = m ] && why="green and approved — mergeable"
       [ -z "$why" ] && [ -n "$verb" ] && [ "$verb" = pr ] && why="no review yet — run your review skill" ;;
     esac
+    fi
     if [ -n "$verb" ]; then
       printf '  %s%d%s%s  #%-6s %s\n' "$C_YEL" "$idx" "$verb" "$C_RST" "${num:-?}" "$why"
       TRIAGE_BATCH+="${TRIAGE_BATCH:+,}$idx$verb"
