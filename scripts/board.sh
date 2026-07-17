@@ -159,10 +159,11 @@ render() {
   local line
   for ((idx=1; idx<=n; idx++)); do
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"
-    local st mrg rev cmts
+    local st mrg rev cmts rname
     IFS=$'\t' read -r num title checks st mrg rev cmts < "$cache/${url//[:\/]/_}" 2>/dev/null || true
-    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %s%s%s %s%-6s%s %s%s%s %s%s%s %3s  %.32s\n' \
-      "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" \
+    rname="${url#https://github.com/}"; rname="${rname#*/}"; rname="${rname%%/pull/*}"
+    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-6s%s %s%s%s %s%s%s %3s  %.32s\n' \
+      "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" "$rname" \
       "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
       "$(st_col "${st:-?}")"      "${st:-?}"                             "$C_RST" \
       "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
@@ -175,7 +176,7 @@ render() {
 
   [ -n "${QUIET:-}" ] && return   # headless --triage: collect rows, draw nothing
   clear
-  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · ? help · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · d deps · ? help · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
@@ -186,8 +187,8 @@ render() {
   else
     printf '  %sno custom verbs — add them to %s (? for help)%s\n' "$C_DIM" "$CMDS_FILE" "$C_RST"
   fi
-  printf '%s  %-16s %-9s %3s  %-7s %-3s %-6s %-8s %-6s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "CI" "ST" "MERGE" "REVIEW" "C" "TITLE" "$C_RST"
-  printf '  %s%s%s\n' "$C_DIM" "------------------------------------------------------------------------------" "$C_RST"
+  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-6s %-8s %-6s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "C" "TITLE" "$C_RST"
+  printf '  %s%s%s\n' "$C_DIM" "---------------------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
 }
 
@@ -207,9 +208,11 @@ action_for() {
     cmd:*)    # user-defined verb from commands.conf
       local tmpl="${CMDS[${verb#cmd:}]:-}"
       [ -z "$tmpl" ] && return
+      local repo="${url#https://github.com/}"; repo="${repo%%/pull/*}"
       tmpl="${tmpl//\{url\}/$url}"
       tmpl="${tmpl//\{num\}/${url##*/}}"
       tmpl="${tmpl//\{cwd\}/$cwd}"
+      tmpl="${tmpl//\{repo\}/$repo}"
       if [[ "$tmpl" == @* ]]; then
         # '@' templates are typed INTO the PR's own claude session (visible in
         # its pane, uses its context) instead of running here.
@@ -258,6 +261,7 @@ spawn_cc() {
   tmpl="${tmpl//\{url\}/$url}"
   tmpl="${tmpl//\{num\}/$num}"
   tmpl="${tmpl//\{cwd\}/$dir}"
+  tmpl="${tmpl//\{repo\}/$repo}"
   if [[ "$tmpl" == @* ]]; then
     [ -z "$pane" ] && { printf '  row %s: no pane id — run "%s" manually\n' "$n" "$follow"; return; }
     # let claude boot before typing the prompt
@@ -283,6 +287,7 @@ declare -A DEFAULT_CMDS=(
   [rs]='@CI on PR {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green.'
   [s]='@/simplify'
   [pub]='gh pr ready {url}'
+  [dep]='@Wrap up dependabot and security compliance for {repo}: list all open dependabot PRs and open dependabot alerts (critical/high first), merge or combine the safe bumps, fix what the alerts require, and report anything that needs manual attention.'
 )
 load_cmds() {
   CMDS=()
@@ -304,7 +309,7 @@ load_cmds() {
 # <verb> = <command template>; runs in the PR's session cwd.
 # Prefix the template with '@' to type it into the PR's own claude session
 # instead (skipped while that session is working).
-# Placeholders: {url} {num} {cwd}
+# Placeholders: {url} {num} {cwd} {repo}
 # pr  = @/prreview {url}
 # ar  = @/pr-comment-response {url}
 # r   = @/pr-rebase {url}
@@ -314,7 +319,7 @@ load_cmds
 
 # full help: keys, batch syntax, built-in verbs, and every loaded custom verb
 show_help() {
-  printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p then <n>+Enter checkout/merge/plan · : batch · t triage · r refresh · w scope · q quit\n' "$C_BLD" "$C_RST"
+  printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p then <n>+Enter checkout/merge/plan · : batch · t triage · d dependabot/security sweep · r refresh · w scope · q quit\n' "$C_BLD" "$C_RST"
   printf '%s  batch%s     :<row><verb>[,<row><verb>…]  e.g. ":1pr,2m,3r,4ar" — no verb = open, so ":1,2" opens two tabs\n' "$C_BLD" "$C_RST"
   printf '%s  built-in%s  o open · c checkout · m merge · p plan · cc new workspace+claude on the PR (combine: ":10ccar" = cc, then run ar there)\n' "$C_BLD" "$C_RST"
   printf '%s  verbs%s     '"'"'@'"'"' = typed into the PR'"'"'s claude session · override defaults in %s:\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
@@ -393,6 +398,57 @@ suggest_verb() {
   [ "$rev" = "-" ] && [ -n "${CMDS[pr]:-}" ] && echo pr
 }
 
+# 'd': per-repo dependabot/security sweep over the repos on the board.
+# Separate from 't' on purpose — repo-level hygiene, not per-PR triage.
+# Fills DEP_BATCH ("3dep,7dep") so repos can be wrapped up all at once (Enter)
+# or one by one (":3dep").
+DEP_BATCH=""
+dep_scan() {
+  DEP_BATCH=""
+  printf '\n%s  dependabot / security (repos on the board):%s\n' "$C_BLD" "$C_RST"
+  local -A REPOS=()
+  local idx url repo dp al crit high sev clean=0
+  for ((idx=1; idx<=${#ROW_URL[@]}; idx++)); do
+    url="${ROW_URL[$idx]:-}"; [ -z "$url" ] && continue
+    repo="${url#https://github.com/}"; repo="${repo%%/pull/*}"
+    [ -n "${REPOS[$repo]:-}" ] || REPOS[$repo]="$idx"   # first row per repo — target for the dep verb
+  done
+  # also repos you contributed to in the past (your authored PRs, any state) —
+  # they get no row token, but their dependabot/security state is still shown
+  while IFS= read -r repo; do
+    [ -z "$repo" ] && continue
+    [ -n "${REPOS[$repo]:-}" ] || REPOS[$repo]=""
+  done < <({ gh search prs --author=@me --sort=updated --limit 50 --json repository --jq '.[].repository.nameWithOwner'
+             gh search prs --assignee=@me --sort=updated --limit 50 --json repository --jq '.[].repository.nameWithOwner'; } 2>/dev/null | sort -u)
+  [ ${#REPOS[@]} -eq 0 ] && { printf '  (no repos)\n'; return; }
+  # ponytail: sequential gh calls, ~1s per repo; parallelize via prcache files if the list grows
+  while IFS= read -r repo; do
+    dp="$(gh pr list --repo "$repo" --author 'app/dependabot' --state open --json number --jq length 2>/dev/null || echo '?')"
+    # needs security_events scope; '?' when the token can't see alerts
+    al=? crit=? high=?
+    IFS=$'\t' read -r al crit high < <(gh api "repos/$repo/dependabot/alerts?state=open&per_page=100" \
+      --jq '[.[].security_advisory.severity] | [length, ([.[]|select(.=="critical")]|length), ([.[]|select(.=="high")]|length)] | @tsv' 2>/dev/null) || true
+    # on 403 (alerts disabled / no scope) gh prints the error JSON to stdout — treat non-numbers as unknown
+    [[ "$al" =~ ^[0-9]+$ ]] || { al='?'; crit='?'; high='?'; }
+    [[ "$dp" =~ ^[0-9]+$ ]] || dp='?'
+    sev=""
+    [ "${crit:-0}" != 0 ] && [ "$crit" != "?" ] && sev=" (${crit} critical"
+    if [ "${high:-0}" != 0 ] && [ "$high" != "?" ]; then sev+="${sev:+, }"; [ -z "$sev" ] && sev=" ("; sev+="${high} high"; fi
+    [ -n "$sev" ] && sev+=")"
+    if { [ "$dp" != "?" ] && [ "$dp" != 0 ]; } || { [ "$al" != "?" ] && [ "$al" != 0 ]; }; then
+      local hint="no PR on the board — check it out manually"
+      [ -n "${REPOS[$repo]}" ] && hint="\":${REPOS[$repo]}dep\" wraps this repo up"
+      printf '  %s%-30s%s %s dependabot PR(s) · %s alert(s)%s — %s\n' \
+        "$( [ "${crit:-0}" != 0 ] && [ "$crit" != "?" ] && printf %s "$C_RED" || printf %s "$C_YEL" )" \
+        "$repo" "$C_RST" "${dp:-?}" "${al:-?}" "$sev" "$hint"
+      [ -n "${REPOS[$repo]}" ] && DEP_BATCH+="${DEP_BATCH:+,}${REPOS[$repo]}dep"
+    else
+      clean=$((clean+1))   # nothing to do — don't list it
+    fi
+  done < <(printf '%s\n' "${!REPOS[@]}" | sort)
+  [ "$clean" -gt 0 ] && printf '  %s(%s clean repo(s) hidden)%s\n' "$C_DIM" "$clean" "$C_RST"
+}
+
 # go through every row, print why each one needs (or doesn't need) attention,
 # and assemble the suggested batch into TRIAGE_BATCH.
 TRIAGE_BATCH=""
@@ -462,6 +518,17 @@ while :; do
         else
           printf '\n  nothing needs attention — press any key '
           IFS= read -rsn1 -t 30 _ || true
+        fi
+        NUMBUF=""; break ;;
+      d)  # dependabot/security sweep: Enter wraps up every flagged repo, or run one repo via ":<n>dep"
+        dep_scan
+        if [ -n "$DEP_BATCH" ]; then
+          printf '\n  wrap up all: %s%s%s — Enter to run, any other key to cancel ' "$C_BLD" "$DEP_BATCH" "$C_RST"
+          IFS= read -rsn1 k2 || k2=x
+          if [ -z "$k2" ]; then printf '\n'; run_batch "$DEP_BATCH"; printf '  (any key to refresh) '; IFS= read -rsn1 -t 30 _ || true; fi
+        else
+          printf '\n  all repos clean — press any key '
+          IFS= read -rsn1 -t 60 _ || true
         fi
         NUMBUF=""; break ;;
       w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; NUMBUF=""; break ;;
