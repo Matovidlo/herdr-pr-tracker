@@ -112,7 +112,14 @@ rev_col() { case "$1" in appr) printf %s "$C_GRN";; me) printf %s "$C_RED";; the
 sts_col() { case "$1" in working) printf %s "$C_GRN";; blocked) printf %s "$C_RED";; idle|done) printf %s "$C_DIM";; esac; }
 
 render() {
-  local idx=0 hidden=0 agents pane agent status cwd url num title state checks out=""
+  local idx=0 hidden=0 discarded=0 agents pane agent status cwd url num title state checks out=""
+  # discarded PRs: locally hidden from the board only ('x' to discard, 'u' to
+  # undiscard all) — never touches GitHub, just a "stop showing me this" list
+  local discf="$STATE_DIR/discarded"
+  local -A DISCARD=()
+  if [ -f "$discf" ]; then
+    while IFS= read -r url; do [ -n "$url" ] && DISCARD["$url"]=1; done < "$discf"
+  fi
   # One jq pass over all agents; current workspace's sessions sort first,
   # optionally narrowed to this board's workspace only ('w').
   local ws=""
@@ -155,7 +162,7 @@ render() {
   wait
   # pass 1b: fold discoveries into the cache, build rows
   local -a R_AGENT=() R_STATUS=() R_URL=() R_CWD=() R_PANE=() R_KIND=()
-  local -A WANT=()
+  local -A WANT=() SEEN=()
   local n=0
   for ((i=1; i<=m; i++)); do
     pane="${A_PANE[$i]}"
@@ -165,12 +172,12 @@ render() {
       URL_CACHE[$pane]="${url:--}"
     fi
     if [ "$url" = "-" ] || [ -z "$url" ]; then hidden=$((hidden+1)); continue; fi
+    if [ -n "${DISCARD[$url]:-}" ]; then discarded=$((discarded+1)); SEEN["$url"]=1; continue; fi
     n=$((n+1)); R_AGENT[$n]="${A_AGENT[$i]}"; R_STATUS[$n]="${A_STATUS[$i]}"; R_URL[$n]="$url"; R_CWD[$n]="${A_CWD[$i]}"; R_PANE[$n]="$pane"; R_KIND[$n]="sess"; WANT["$url"]=1
+    SEEN["$url"]=1
   done
 
   local u2
-  local -A SEEN=()
-  for ((i=1; i<=n; i++)); do SEEN["${R_URL[$i]}"]=1; done
 
   # pass 1c: PRs waiting for YOUR review (review requested from you, directly
   # or via a team) — shown right after the session rows, before your other
@@ -181,6 +188,7 @@ render() {
       [ -z "$u2" ] && continue
       [ -n "${SEEN[$u2]:-}" ] && continue
       SEEN["$u2"]=1
+      if [ -n "${DISCARD[$u2]:-}" ]; then discarded=$((discarded+1)); continue; fi
       n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; R_KIND[$n]="rev"; WANT["$u2"]=1
     done < "$revreq_f"
   fi
@@ -194,6 +202,7 @@ render() {
       [ -z "$u2" ] && continue
       [ -n "${SEEN[$u2]:-}" ] && continue
       SEEN["$u2"]=1
+      if [ -n "${DISCARD[$u2]:-}" ]; then discarded=$((discarded+1)); continue; fi
       n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; R_KIND[$n]="mine"; WANT["$u2"]=1
     done < "$mine_f"
   fi
@@ -250,10 +259,11 @@ render() {
   done
   [ "$n" -eq 0 ] && out+="  (no PRs found)"$'\n'
   [ "$hidden" -gt 0 ] && out+=$'\n'"  ${C_DIM}$n PR row(s) shown · $hidden session(s) have no PR and are hidden (r rediscovers)${C_RST}"$'\n'
+  [ "$discarded" -gt 0 ] && out+="  ${C_DIM}$discarded PR(s) discarded (u undiscards all)${C_RST}"$'\n'
 
   [ -n "${QUIET:-}" ] && return   # headless --triage: collect rows, draw nothing
   clear
-  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · d deps · ? help · r refresh · c checkout · m merge · p plan · w scope · q quit)%s\n' \
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · d deps · ? help · r refresh · c checkout · m merge · p plan · x discard · u undiscard · w scope · q quit)%s\n' \
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
@@ -282,6 +292,9 @@ action_for() {
     checkout) (cd "${cwd:-.}" && gh pr checkout "$url") ;;
     merge)    (cd "${cwd:-.}" && gh pr merge "$url") ;;   # interactive; uses repo defaults
     plan)     local f="$PLANS_DIR/$(basename "$url").md"; ${EDITOR:-vi} "$f" ;;  # ponytail: pane stdout is a pipe, full-screen editors may warn; good enough
+    discard)  # local-only "stop showing me this PR" — never touches GitHub; 'u' undoes
+      printf '%s\n' "$url" >> "$STATE_DIR/discarded"
+      sort -u "$STATE_DIR/discarded" -o "$STATE_DIR/discarded" ;;
     cmd:*)    # user-defined verb from commands.conf
       local tmpl="${CMDS[${verb#cmd:}]:-}"
       [ -z "$tmpl" ] && return
@@ -445,9 +458,9 @@ load_cmds
 
 # full help: keys, batch syntax, built-in verbs, and every loaded custom verb
 show_help() {
-  printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p then <n>+Enter checkout/merge/plan · : batch · t triage · d dependabot/security sweep · r refresh · w scope · q quit\n' "$C_BLD" "$C_RST"
+  printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p/x then <n>+Enter checkout/merge/plan/discard · : batch · t triage · d dependabot/security sweep · r refresh · u undiscard all · w scope · q quit\n' "$C_BLD" "$C_RST"
   printf '%s  batch%s     :<row><verb>[,<row><verb>…]  e.g. ":1pr,2m,3r,4ar" — no verb = open, so ":1,2" opens two tabs\n' "$C_BLD" "$C_RST"
-  printf '%s  built-in%s  o open · c checkout · m merge · p plan · cc new workspace+claude on the PR (combine: ":10ccar" = cc, then run ar there)\n' "$C_BLD" "$C_RST"
+  printf '%s  built-in%s  o open · c checkout · m merge · p plan · x discard (local-only, "u" undoes) · cc new workspace+claude on the PR (combine: ":10ccar" = cc, then run ar there)\n' "$C_BLD" "$C_RST"
   printf '%s  verbs%s     '"'"'@'"'"' = typed into the PR'"'"'s claude session · override defaults in %s:\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
   local v tag
   while IFS= read -r v; do
@@ -467,6 +480,7 @@ resolve_verb() {
     c)    echo checkout ;;
     m)    echo merge ;;
     p)    echo plan ;;
+    x)    echo discard ;;   # locally hide this PR from the board; 'u' undiscards all
     cc*)  # spawn a fresh workspace+claude for the PR; optional follow-up verb ("ccar")
       local f="${1#cc}"
       if [ -z "$f" ] || [ -n "${CMDS[$f]:-}" ]; then echo "spawn:$f"; else return 1; fi ;;
@@ -667,10 +681,12 @@ while :; do
         fi
         break ;;
       w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; break ;;
+      u) : > "$STATE_DIR/discarded"; break ;;   # undiscard all
       '?') show_help; break ;;   # NB: quoted — bare ? is a glob matching any key
       c) PENDING_VERB="checkout"; printf '\r  [checkout] type row number + Enter … ' ;;
       m) PENDING_VERB="merge";    printf '\r  [merge] type row number + Enter … '    ;;
       p) PENDING_VERB="plan";     printf '\r  [plan] type row number + Enter … '     ;;
+      x) PENDING_VERB="discard";  printf '\r  [discard] type row number + Enter … '  ;;
       :)  # explicit command line: "1,2c,3m" + Enter runs each token in order
         printf '\r  cmd> '
         IFS= read -r cmdline || cmdline=""
