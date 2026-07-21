@@ -18,6 +18,16 @@ done
 declare -a ROW_URL ROW_CWD ROW_PANE ROW_STATUS ROW_KIND
 # pane_id -> PR url; scraping pane scrollback is the slowest step, do it once
 # per pane and only rediscover on explicit refresh ('r').
+STALE_SECS=600   # PR state + search results are reused within this window; 'r' forces a live refetch
+FORCE_REFRESH=""
+# true if $1 exists, is non-empty, and is younger than STALE_SECS (skipped when FORCE_REFRESH is set)
+fresh_enough() {
+  [ -n "$FORCE_REFRESH" ] && return 1
+  local f="$1" mtime
+  [ -s "$f" ] || return 1
+  mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || return 1
+  (( $(date +%s) - mtime < STALE_SECS ))
+}
 declare -A URL_CACHE
 
 # Find the PR url for one agent: first scrape recent pane text, then fall back to
@@ -119,12 +129,16 @@ render() {
 
   # kick off the review-requested/authored/assigned searches now so they run
   # concurrently with the per-pane scrape below instead of serially after it —
-  # these were the two biggest chunks of first-render latency.
+  # these were the two biggest chunks of first-render latency. Skipped
+  # entirely when the cached result is still fresh (STALE_SECS / 'r').
   local revreq_f="$cache/_revreq" mine_f="$cache/_mine"
-  : > "$revreq_f"; : > "$mine_f"
+  [ -f "$revreq_f" ] || : > "$revreq_f"
+  [ -f "$mine_f" ] || : > "$mine_f"
   if [ "$SCOPE" = all ]; then
-    gh search prs --review-requested=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' -- -author:app/dependabot > "$revreq_f" 2>/dev/null &
-    if [ -f "$STATE_DIR/show-authored" ]; then
+    if ! fresh_enough "$revreq_f"; then
+      gh search prs --review-requested=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' -- -author:app/dependabot > "$revreq_f" 2>/dev/null &
+    fi
+    if [ -f "$STATE_DIR/show-authored" ] && ! fresh_enough "$mine_f"; then
       { gh search prs --author=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'
         gh search prs --assignee=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'; } > "$mine_f" 2>/dev/null &
     fi
@@ -184,12 +198,14 @@ render() {
     done < "$mine_f"
   fi
 
-  # pass 2: fetch all PR states in parallel, deduped — wall time = one gh call
+  # pass 2: fetch PR states in parallel, deduped, skipping anything still fresh —
+  # this is what made every render (not just the first) pay for N gh calls.
   local u
   for u in "${!WANT[@]}"; do
-    fetch_pr "$u" "$cache/${u//[:\/]/_}" &
+    fresh_enough "$cache/${u//[:\/]/_}" || fetch_pr "$u" "$cache/${u//[:\/]/_}" &
   done
   wait
+  FORCE_REFRESH=""
 
   # pass 3: assemble off-screen, then draw in one shot (no flicker)
   ROW_URL=(); ROW_CWD=(); ROW_PANE=(); ROW_STATUS=(); ROW_KIND=()
@@ -627,7 +643,7 @@ while :; do
   while IFS= read -rsn1 -t 10 key; do
     case "$key" in
       q) clear; exit 0 ;;
-      r) URL_CACHE=(); load_cmds; break ;;
+      r) URL_CACHE=(); FORCE_REFRESH=1; load_cmds; break ;;
       t)  # triage: suggest a batch from the indicators, Enter to run it
         triage
         if [ -n "$TRIAGE_BATCH" ]; then
