@@ -18,6 +18,16 @@ done
 declare -a ROW_URL ROW_CWD ROW_PANE ROW_STATUS ROW_KIND
 # pane_id -> PR url; scraping pane scrollback is the slowest step, do it once
 # per pane and only rediscover on explicit refresh ('r').
+STALE_SECS=600   # PR state + search results are reused within this window; 'r' forces a live refetch
+FORCE_REFRESH=""
+# true if $1 exists, is non-empty, and is younger than STALE_SECS (skipped when FORCE_REFRESH is set)
+fresh_enough() {
+  [ -n "$FORCE_REFRESH" ] && return 1
+  local f="$1" mtime
+  [ -s "$f" ] || return 1
+  mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || return 1
+  (( $(date +%s) - mtime < STALE_SECS ))
+}
 declare -A URL_CACHE
 
 # Find the PR url for one agent: first scrape recent pane text, then fall back to
@@ -38,13 +48,14 @@ find_pr() {
 }
 
 SCOPE="all"   # all | ws ('w' toggles); PR rows get numbers 1-9, others are just listed
+MY_LOGIN="$(gh api user --jq .login 2>/dev/null)"   # fetched once; used to flag "does MY review still block this"
 
 # fetch one PR's display fields into a cache file (used in parallel)
-# TSV: number, title, ci, pr-state, merge, review, comment-count
+# TSV: number, title, ci, pr-state, merge, review, comment-count, author, reviewers, my-review-state
 fetch_pr() {
   local url="$1" out="$2"
-  gh pr view "$url" --json number,title,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,comments,reviews,author,reviewRequests 2>/dev/null \
-  | jq -r '[(.number // "?"), (.title // ""),
+  gh pr view "$url" --json number,title,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,comments,reviews,author,reviewRequests,latestReviews 2>/dev/null \
+  | jq -r --arg login "$MY_LOGIN" '[(.number // "?"), (.title // ""),
             ([.statusCheckRollup[]?.conclusion // .statusCheckRollup[]?.state] | map(select(.!=null))
              | if length==0 then "-"
                elif any(.=="FAILURE" or .=="ERROR" or .=="TIMED_OUT") then "FAIL"
@@ -66,7 +77,9 @@ fetch_pr() {
             ((.comments|length) + ([.reviews[]? | select(.body != "")] | length)),
             (.author.login // "-"),
             # pending reviewers: users have .login, teams have .name/.slug
-            ([.reviewRequests[]? | .login // .slug // .name // empty] | join(","))
+            ([.reviewRequests[]? | .login // .slug // .name // empty] | join(",")),
+            # my own latest review state (empty if I never reviewed, or login unknown)
+            (if $login=="" then "" else ([.latestReviews[]? | select(.author.login==$login) | .state] | .[0] // "") end)
            ] | @tsv' > "$out" 2>/dev/null
 }
 
@@ -114,6 +127,23 @@ render() {
   local cache="$STATE_DIR/prcache"
   mkdir -p "$cache"
 
+  # kick off the review-requested/authored/assigned searches now so they run
+  # concurrently with the per-pane scrape below instead of serially after it —
+  # these were the two biggest chunks of first-render latency. Skipped
+  # entirely when the cached result is still fresh (STALE_SECS / 'r').
+  local revreq_f="$cache/_revreq" mine_f="$cache/_mine"
+  [ -f "$revreq_f" ] || : > "$revreq_f"
+  [ -f "$mine_f" ] || : > "$mine_f"
+  if [ "$SCOPE" = all ]; then
+    if ! fresh_enough "$revreq_f"; then
+      gh search prs --review-requested=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' -- -author:app/dependabot > "$revreq_f" 2>/dev/null &
+    fi
+    if [ -f "$STATE_DIR/show-authored" ] && ! fresh_enough "$mine_f"; then
+      { gh search prs --author=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'
+        gh search prs --assignee=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'; } > "$mine_f" 2>/dev/null &
+    fi
+  fi
+
   # pass 1a: discover uncached panes' PR urls in parallel
   local -a A_PANE=() A_AGENT=() A_STATUS=() A_CWD=()
   local m=0 i
@@ -152,7 +182,7 @@ render() {
       [ -n "${SEEN[$u2]:-}" ] && continue
       SEEN["$u2"]=1
       n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; R_KIND[$n]="rev"; WANT["$u2"]=1
-    done < <(gh search prs --review-requested=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url' -- -author:app/dependabot 2>/dev/null)
+    done < "$revreq_f"
   fi
 
   # pass 1d: your other open PRs (no claude session) — authored by you or
@@ -165,16 +195,17 @@ render() {
       [ -n "${SEEN[$u2]:-}" ] && continue
       SEEN["$u2"]=1
       n=$((n+1)); R_AGENT[$n]="-"; R_STATUS[$n]="-"; R_URL[$n]="$u2"; R_CWD[$n]=""; R_PANE[$n]=""; R_KIND[$n]="mine"; WANT["$u2"]=1
-    done < <({ gh search prs --author=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'
-               gh search prs --assignee=@me --state=open --sort=updated --limit 20 --json url --jq '.[].url'; } 2>/dev/null)
+    done < "$mine_f"
   fi
 
-  # pass 2: fetch all PR states in parallel, deduped — wall time = one gh call
+  # pass 2: fetch PR states in parallel, deduped, skipping anything still fresh —
+  # this is what made every render (not just the first) pay for N gh calls.
   local u
   for u in "${!WANT[@]}"; do
-    fetch_pr "$u" "$cache/${u//[:\/]/_}" &
+    fresh_enough "$cache/${u//[:\/]/_}" || fetch_pr "$u" "$cache/${u//[:\/]/_}" &
   done
   wait
+  FORCE_REFRESH=""
 
   # pass 3: assemble off-screen, then draw in one shot (no flicker)
   ROW_URL=(); ROW_CWD=(); ROW_PANE=(); ROW_STATUS=(); ROW_KIND=()
@@ -189,18 +220,31 @@ render() {
       out+="  ${C_DIM}— your other open PRs —${C_RST}"$'\n'
     fi
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"; ROW_KIND[$idx]="${R_KIND[$idx]:-}"
-    local st mrg rev cmts author reviewers rname revd
-    IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers < "$cache/${url//[:\/]/_}" 2>/dev/null || true
+    local st mrg rev cmts author reviewers myrev rname revd revcol
+    IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers myrev < "$cache/${url//[:\/]/_}" 2>/dev/null || true
     rname="${url#https://github.com/}"; rname="${rname#*/}"; rname="${rname%%/pull/*}"
     # REVIEW shows WHO it waits on: →<first pending reviewer> instead of →them
     revd="$(rev_sym "${rev:--}")"
+    revcol="$rev"
     [ "$rev" = them ] && [ -n "${reviewers:-}" ] && revd="→${reviewers%%,*}"
+    # "waiting for your review" rows: overall reviewDecision (appr/them) can't tell
+    # you whether YOUR review specifically still blocks it — repos with multiple
+    # required approvers can show REVIEW_REQUIRED even after you've approved.
+    if [ "${R_KIND[$idx]:-}" = rev ]; then
+      case "$myrev" in
+        APPROVED)
+          if [ "$rev" = appr ]; then revd="✓done"; revcol=appr
+          else revd="✓+more"; revcol=them; fi ;;   # you approved; other required reviewers still pending
+        CHANGES_REQUESTED) revd="✗mine"; revcol=me ;;   # your own changes-requested still stands
+        *) revd="→need"; revcol=them ;;                 # you haven't reviewed yet
+      esac
+    fi
     printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-2s%s %s%s%s %s%s%s %-12.12s %3s  %.32s\n' \
       "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" "$rname" \
       "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
       "$(st_col "${st:-?}")"      "$(st_sym "${st:-?}")"                 "$C_RST" \
       "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
-      "$(rev_col "${rev:--}")"    "$(pad "${revd:0:14}" 14)"             "$C_RST" \
+      "$(rev_col "${revcol:--}")" "$(pad "${revd:0:14}" 14)"             "$C_RST" \
       "${author:--}" "${cmts:-0}" "${title:-}"
     out+="$line"
   done
@@ -591,7 +635,6 @@ if [ "${1:-}" = "--triage" ]; then
 fi
 
 PENDING_VERB="open"
-NUMBUF=""
 while :; do
   render
   # Inner key loop: verb/digit keys don't pay for a re-render; only timeout,
@@ -600,7 +643,7 @@ while :; do
   while IFS= read -rsn1 -t 10 key; do
     case "$key" in
       q) clear; exit 0 ;;
-      r) URL_CACHE=(); NUMBUF=""; load_cmds; break ;;
+      r) URL_CACHE=(); FORCE_REFRESH=1; load_cmds; break ;;
       t)  # triage: suggest a batch from the indicators, Enter to run it
         triage
         if [ -n "$TRIAGE_BATCH" ]; then
@@ -611,7 +654,7 @@ while :; do
           printf '\n  nothing needs attention — press any key '
           IFS= read -rsn1 -t 30 _ || true
         fi
-        NUMBUF=""; break ;;
+        break ;;
       d)  # dependabot/security sweep: Enter wraps up every flagged repo, or run one repo via ":<n>dep"
         dep_scan
         if [ -n "$DEP_BATCH" ]; then
@@ -622,35 +665,34 @@ while :; do
           printf '\n  all repos clean — press any key '
           IFS= read -rsn1 -t 60 _ || true
         fi
-        NUMBUF=""; break ;;
-      w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; NUMBUF=""; break ;;
-      '?') show_help; NUMBUF=""; break ;;   # NB: quoted — bare ? is a glob matching any key
-      c) PENDING_VERB="checkout"; NUMBUF=""; printf '\r  [checkout] type row number + Enter … ' ;;
-      m) PENDING_VERB="merge";    NUMBUF=""; printf '\r  [merge] type row number + Enter … '    ;;
-      p) PENDING_VERB="plan";     NUMBUF=""; printf '\r  [plan] type row number + Enter … '     ;;
-      :)  # command line: "1,2c,3m" + Enter runs each token in order
+        break ;;
+      w) [ "$SCOPE" = ws ] && SCOPE="all" || SCOPE="ws"; break ;;
+      '?') show_help; break ;;   # NB: quoted — bare ? is a glob matching any key
+      c) PENDING_VERB="checkout"; printf '\r  [checkout] type row number + Enter … ' ;;
+      m) PENDING_VERB="merge";    printf '\r  [merge] type row number + Enter … '    ;;
+      p) PENDING_VERB="plan";     printf '\r  [plan] type row number + Enter … '     ;;
+      :)  # explicit command line: "1,2c,3m" + Enter runs each token in order
         printf '\r  cmd> '
         IFS= read -r cmdline || cmdline=""
         printf '\n'
         [ -n "$cmdline" ] && run_batch "$cmdline"
-        NUMBUF=""; PENDING_VERB="open"
+        PENDING_VERB="open"
         printf '  (any key to refresh) '
         IFS= read -rsn1 -t 30 _ || true
         break ;;
-      [0-9]) NUMBUF+="$key"; printf '\r  %s row: %s (Enter to run) ' "$PENDING_VERB" "$NUMBUF" ;;
-      ''|$'\n'|$'\r')   # Enter — read -n1 yields '' for newline
-        [ -z "$NUMBUF" ] && continue
-        n="$NUMBUF"; NUMBUF=""
-        if [ -z "${ROW_URL[$n]:-}" ]; then
-          printf '\r  no PR on row %s (rows: 1-%s)          ' "$n" "${#ROW_URL[@]}"
-          PENDING_VERB="open"
+      [0-9])  # digit starts a batch line directly — no ':' needed for "1,2c,3m"
+        printf '\r  %s%s' "$( [ "$PENDING_VERB" != open ] && echo "[$PENDING_VERB] " )" "$key"
+        IFS= read -r rest || rest=""
+        printf '\n'
+        if [ "$PENDING_VERB" != open ] && [[ "$key$rest" =~ ^[0-9]+$ ]]; then
+          action_for "$key$rest" "$PENDING_VERB"   # c/m/p mode: plain row number applies that verb
         else
-          printf '\r  %s row %s … ' "$PENDING_VERB" "$n"
-          action_for "$n" "$PENDING_VERB"
-          printf 'done \n'
-          PENDING_VERB="open"; break
-        fi ;;
-      *) NUMBUF="" ;;
+          run_batch "$key$rest"
+        fi
+        PENDING_VERB="open"
+        printf '  (any key to refresh) '
+        IFS= read -rsn1 -t 30 _ || true
+        break ;;
     esac
   done
 done
