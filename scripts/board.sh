@@ -83,6 +83,17 @@ fetch_pr() {
            ] | @tsv' > "$out" 2>/dev/null
 }
 
+# count open Dependabot alerts at high/critical severity for one repo (owner/name).
+# Needs security_events read scope; on 403 gh prints an error blob to stdout,
+# which fails the regex check at read time and shows as "?" (same convention
+# as dep_scan's al/crit/high fields).
+fetch_sec() {
+  local repo="$1" out="$2"
+  gh api "repos/$repo/dependabot/alerts?state=open&per_page=100" \
+    --jq '[.[].security_advisory.severity] | map(select(.=="critical" or .=="high")) | length' \
+    > "$out" 2>/dev/null
+}
+
 # printf %-Ns pads by bytes, not display columns; widen the field by the
 # byte/char surplus so rows with ✓/✗/… still line up.
 pad() {
@@ -98,6 +109,7 @@ pad() {
 ci_sym()  { case "$1" in ok) echo "✓";; FAIL) echo "✗";; ...) echo "…";; *) echo "-";; esac; }
 mrg_sym() { case "$1" in ok) echo "✓";; confl) echo "✗confl";; behind) echo "↓behind";; no) echo "✗";; *) echo "$1";; esac; }
 rev_sym() { case "$1" in appr) echo "✓";; me) echo "←me";; them) echo "→them";; *) echo "-";; esac; }
+sec_sym() { case "$1" in 0) echo "-";; *) echo "$1";; esac; }   # "$1" is a count, "?" (no scope), or 0
 # one colored letter for PR lifecycle: D draft, R ready, M merged, C closed
 st_sym()  { case "$1" in ready) echo "R";; draft) echo "D";; merged) echo "M";; closed) echo "C";; *) echo "?";; esac; }
 
@@ -109,6 +121,7 @@ ci_col()  { case "$1" in ok) printf %s "$C_GRN";; FAIL) printf %s "$C_RED";; ...
 mrg_col() { case "$1" in ok) printf %s "$C_GRN";; confl|no) printf %s "$C_RED";; behind) printf %s "$C_YEL";; esac; }
 st_col()  { case "$1" in ready) printf %s "$C_GRN";; draft) printf %s "$C_YEL";; merged) printf %s "$C_MAG";; closed) printf %s "$C_DIM";; esac; }
 rev_col() { case "$1" in appr) printf %s "$C_GRN";; me) printf %s "$C_RED";; them) printf %s "$C_YEL";; esac; }
+sec_col() { case "$1" in 0|'?') printf %s "$C_DIM";; *) printf %s "$C_RED";; esac; }   # any high/critical alert -> red
 sts_col() { case "$1" in working) printf %s "$C_GRN";; blocked) printf %s "$C_RED";; idle|done) printf %s "$C_DIM";; esac; }
 
 render() {
@@ -213,6 +226,16 @@ render() {
   for u in "${!WANT[@]}"; do
     fresh_enough "$cache/${u//[:\/]/_}" || fetch_pr "$u" "$cache/${u//[:\/]/_}" &
   done
+  # one Dependabot-alert lookup per distinct repo on the board, not per PR
+  local -A WANT_REPO=()
+  local repo
+  for u in "${!WANT[@]}"; do
+    repo="${u#https://github.com/}"; repo="${repo%%/pull/*}"
+    WANT_REPO["$repo"]=1
+  done
+  for repo in "${!WANT_REPO[@]}"; do
+    fresh_enough "$cache/sec_${repo//\//_}" || fetch_sec "$repo" "$cache/sec_${repo//\//_}" &
+  done
   wait
   FORCE_REFRESH=""
 
@@ -229,9 +252,11 @@ render() {
       out+="  ${C_DIM}— your other open PRs —${C_RST}"$'\n'
     fi
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"; ROW_KIND[$idx]="${R_KIND[$idx]:-}"
-    local st mrg rev cmts author reviewers myrev rname revd revcol
+    local st mrg rev cmts author reviewers myrev rname revd revcol repo secn
     IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers myrev < "$cache/${url//[:\/]/_}" 2>/dev/null || true
-    rname="${url#https://github.com/}"; rname="${rname#*/}"; rname="${rname%%/pull/*}"
+    rname="${url#https://github.com/}"; repo="${rname%%/pull/*}"; rname="${rname#*/}"; rname="${rname%%/pull/*}"
+    secn="$(cat "$cache/sec_${repo//\//_}" 2>/dev/null)"
+    [[ "$secn" =~ ^[0-9]+$ ]] || secn='?'
     # REVIEW shows WHO it waits on: →<first pending reviewer> instead of →them
     revd="$(rev_sym "${rev:--}")"
     revcol="$rev"
@@ -248,12 +273,13 @@ render() {
         *) revd="→need"; revcol=them ;;                 # you haven't reviewed yet
       esac
     fi
-    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-2s%s %s%s%s %s%s%s %-12.12s %3s  %.32s\n' \
+    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-2s%s %s%s%s %s%s%s %s%s%s %-12.12s %3s  %.32s\n' \
       "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" "$rname" \
       "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
       "$(st_col "${st:-?}")"      "$(st_sym "${st:-?}")"                 "$C_RST" \
       "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
       "$(rev_col "${revcol:--}")" "$(pad "${revd:0:14}" 14)"             "$C_RST" \
+      "$(sec_col "$secn")"        "$(pad "$(sec_sym "$secn")" 3)"        "$C_RST" \
       "${author:--}" "${cmts:-0}" "${title:-}"
     out+="$line"
   done
@@ -274,8 +300,8 @@ render() {
   else
     printf '  %sno custom verbs — add them to %s (? for help)%s\n' "$C_DIM" "$CMDS_FILE" "$C_RST"
   fi
-  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-2s %-8s %-14s %-12s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "AUTHOR" "C" "TITLE" "$C_RST"
-  printf '  %s%s%s\n' "$C_DIM" "--------------------------------------------------------------------------------------------------------------" "$C_RST"
+  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-2s %-8s %-14s %-3s %-12s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "SEC" "AUTHOR" "C" "TITLE" "$C_RST"
+  printf '  %s%s%s\n' "$C_DIM" "-----------------------------------------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
 }
 
