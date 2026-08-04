@@ -403,9 +403,22 @@ spawn_cc() {
     [ -z "$pane" ] && { printf '  row %s: no pane id — run "%s" manually\n' "$n" "$follow"; return; }
     # let claude boot before typing the prompt
     "$HERDR" agent wait "$pane" --status idle --timeout 90000 >/dev/null 2>&1
-    "$HERDR" pane run "$pane" "${tmpl#@}" >/dev/null 2>&1 \
-      && printf '  row %s: sent %s to the new session\n' "$n" "$follow" \
-      || printf '  row %s: failed to send %s\n' "$n" "$follow"
+    # agent_status flips to idle before Claude's own stdin reader attaches, so
+    # typing right away drops the first prompt on the floor (root cause of
+    # "ccar" needing a manual "ar" afterwards). Give it a beat, then verify
+    # the text actually landed in the pane and retry once if it didn't.
+    local payload="${tmpl#@}" sent=0 try
+    for try in 1 2; do
+      sleep 2
+      "$HERDR" pane run "$pane" "$payload" >/dev/null 2>&1
+      sleep 1
+      "$HERDR" pane read "$pane" --source recent --lines 40 2>/dev/null | grep -qF "${payload:0:20}" && { sent=1; break; }
+    done
+    if [ "$sent" = 1 ]; then
+      printf '  row %s: sent %s to the new session\n' "$n" "$follow"
+    else
+      printf '  row %s: failed to send %s — retry manually with ":%s%s"\n' "$n" "$follow" "$n" "$follow"
+    fi
   else
     (cd "$dir" && bash -c "$tmpl")
   fi
@@ -635,6 +648,35 @@ triage() {
   done
 }
 
+# reads the rest of an input line one keystroke at a time and returns it on
+# stdout. herdr forwards raw keystrokes to this script's stdin rather than a
+# real tty, so bash's line editing never sees them — a plain `read -r line`
+# stores a backspace byte as-is instead of deleting the previous character,
+# which is why one character was always left un-erasable. Backspacing past
+# the first character cancels (return 1) instead of waiting for more input,
+# so an emptied line drops straight back to the default board view.
+# Usage: if read_editable "$seed"; then rest="$READLINE_RESULT"; else <cancelled>; fi
+# Sets READLINE_RESULT rather than printing it — the per-keystroke echoes
+# below must reach the terminal directly, so the result can't also go
+# through stdout or a `$(...)` capture would swallow the echoes too.
+READLINE_RESULT=""
+read_editable() {
+  local buf="$1" ch
+  while IFS= read -rsn1 -t 30 ch; do
+    case "$ch" in
+      '') break ;;                     # Enter
+      $'\177'|$'\b')                   # backspace: DEL or BS
+        [ -z "$buf" ] && return 1
+        buf="${buf%?}"
+        printf '\b \b'
+        [ -z "$buf" ] && return 1      # erased back to empty: cancel
+        ;;
+      *) buf+="$ch"; printf '%s' "$ch" ;;
+    esac
+  done
+  READLINE_RESULT="$buf"
+}
+
 # headless daily routine: board.sh --triage [--execute]
 # Prints suggestions (and a herdr notification); --execute also runs them.
 # Cron example:  0 9 * * 1-5  bash .../scripts/board.sh --triage --execute
@@ -689,25 +731,33 @@ while :; do
       x) PENDING_VERB="discard";  printf '\r  [discard] type row number + Enter … '  ;;
       :)  # explicit command line: "1,2c,3m" + Enter runs each token in order
         printf '\r  cmd> '
-        IFS= read -r cmdline || cmdline=""
-        printf '\n'
-        [ -n "$cmdline" ] && run_batch "$cmdline"
+        if read_editable ""; then
+          cmdline="$READLINE_RESULT"
+          printf '\n'
+          [ -n "$cmdline" ] && run_batch "$cmdline"
+          printf '  (any key to refresh) '
+          IFS= read -rsn1 -t 30 _ || true
+        else
+          printf '\n'   # backspaced to empty: cancelled, fall through to the board
+        fi
         PENDING_VERB="open"
-        printf '  (any key to refresh) '
-        IFS= read -rsn1 -t 30 _ || true
         break ;;
       [0-9])  # digit starts a batch line directly — no ':' needed for "1,2c,3m"
         printf '\r  %s%s' "$( [ "$PENDING_VERB" != open ] && echo "[$PENDING_VERB] " )" "$key"
-        IFS= read -r rest || rest=""
-        printf '\n'
-        if [ "$PENDING_VERB" != open ] && [[ "$key$rest" =~ ^[0-9]+$ ]]; then
-          action_for "$key$rest" "$PENDING_VERB"   # c/m/p mode: plain row number applies that verb
+        if read_editable "$key"; then
+          rest="$READLINE_RESULT"
+          printf '\n'
+          if [ "$PENDING_VERB" != open ] && [[ "$rest" =~ ^[0-9]+$ ]]; then
+            action_for "$rest" "$PENDING_VERB"   # c/m/p mode: plain row number applies that verb
+          else
+            run_batch "$rest"
+          fi
+          printf '  (any key to refresh) '
+          IFS= read -rsn1 -t 30 _ || true
         else
-          run_batch "$key$rest"
+          printf '\n'   # backspaced to empty: cancelled, fall through to the board
         fi
         PENDING_VERB="open"
-        printf '  (any key to refresh) '
-        IFS= read -rsn1 -t 30 _ || true
         break ;;
     esac
   done
