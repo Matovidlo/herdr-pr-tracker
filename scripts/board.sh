@@ -83,15 +83,31 @@ fetch_pr() {
            ] | @tsv' > "$out" 2>/dev/null
 }
 
-# count open Dependabot alerts at high/critical severity for one repo (owner/name).
-# Needs security_events read scope; on 403 gh prints an error blob to stdout,
-# which fails the regex check at read time and shows as "?" (same convention
-# as dep_scan's al/crit/high fields).
+# count open High/Critical security findings for one repo (owner/name), summed
+# across Dependabot, code scanning, and secret scanning. Secret-scanning alerts
+# carry no severity field (GitHub doesn't grade them) — any live leak counts,
+# since a found secret is inherently critical.
+# Each source is queried independently: a source this token can't see (missing
+# security_events scope, GHAS not enabled, 403/404) just contributes 0 rather
+# than voiding the whole count — only when ALL THREE are unreadable do we fall
+# back to "?", since that likely means the token has no security_events scope
+# at all (same convention as dep_scan's al/crit/high fields).
 fetch_sec() {
-  local repo="$1" out="$2"
-  gh api "repos/$repo/dependabot/alerts?state=open&per_page=100" \
-    --jq '[.[].security_advisory.severity] | map(select(.=="critical" or .=="high")) | length' \
-    > "$out" 2>/dev/null
+  local repo="$1" out="$2" dep cs ss
+  dep="$(gh api "repos/$repo/dependabot/alerts?state=open&per_page=100" \
+    --jq '[.[].security_advisory.severity] | map(select(.=="critical" or .=="high")) | length' 2>/dev/null)"
+  cs="$(gh api "repos/$repo/code-scanning/alerts?state=open&per_page=100" \
+    --jq '[.[].rule.security_severity_level] | map(select(.=="critical" or .=="high")) | length' 2>/dev/null)"
+  ss="$(gh api "repos/$repo/secret-scanning/alerts?state=open&per_page=100" \
+    --jq 'length' 2>/dev/null)"
+  [[ "$dep" =~ ^[0-9]+$ ]] || dep=""
+  [[ "$cs"  =~ ^[0-9]+$ ]] || cs=""
+  [[ "$ss"  =~ ^[0-9]+$ ]] || ss=""
+  if [ -z "$dep$cs$ss" ]; then
+    printf '?' > "$out"
+  else
+    printf '%s' "$(( ${dep:-0} + ${cs:-0} + ${ss:-0} ))" > "$out"
+  fi
 }
 
 # printf %-Ns pads by bytes, not display columns; widen the field by the
