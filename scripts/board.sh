@@ -731,7 +731,6 @@ while :; do
       x) PENDING_VERB="discard";  printf '\r  [discard] type row number + Enter … '  ;;
       :)  # explicit command line: "1,2c,3m" + Enter runs each token in order
         printf '\r  cmd> '
-        local cmdline
         if read_editable ""; then
           cmdline="$READLINE_RESULT"
           printf '\n'
@@ -745,7 +744,6 @@ while :; do
         break ;;
       [0-9])  # digit starts a batch line directly — no ':' needed for "1,2c,3m"
         printf '\r  %s%s' "$( [ "$PENDING_VERB" != open ] && echo "[$PENDING_VERB] " )" "$key"
-        local rest
         if read_editable "$key"; then
           rest="$READLINE_RESULT"
           printf '\n'
