@@ -51,11 +51,34 @@ SCOPE="all"   # all | ws ('w' toggles); PR rows get numbers 1-9, others are just
 MY_LOGIN="$(gh api user --jq .login 2>/dev/null)"   # fetched once; used to flag "does MY review still block this"
 
 # fetch one PR's display fields into a cache file (used in parallel)
-# TSV: number, title, ci, pr-state, merge, review, comment-count, author, reviewers, my-review-state
+# TSV: number, title, ci, pr-state, merge, review, comment-count, author,
+#      pending-human-reviewers, my-review-state, human-reviewer-detail,
+#      approved-count, bot-reviewer-detail, pending-bots
+# Bot accounts (login ending "[bot]") are split out everywhere: a bot can
+# comment/request-changes but will never supply the human approval a repo's
+# branch protection actually wants, so lumping it into "waiting on them" is
+# misleading — it's tracked separately and never blocks the review verdict.
 fetch_pr() {
   local url="$1" out="$2"
   gh pr view "$url" --json number,title,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,comments,reviews,author,reviewRequests,latestReviews 2>/dev/null \
-  | jq -r --arg login "$MY_LOGIN" '[(.number // "?"), (.title // ""),
+  | jq -r --arg login "$MY_LOGIN" '
+            # ponytail: gh CLI flattens review authors to a bare login with no
+            # type info, so bot detection is pattern-matching, not a real
+            # "__typename==Bot" check (that needs a raw GraphQL call per PR).
+            # Known offenders that do not follow the "[bot]" convention are
+            # listed explicitly; upgrade to GraphQL author.__typename if more
+            # show up.
+            def is_bot: (. // "") | (endswith("[bot]") or endswith("-bot")
+                         or . == "copilot-pull-request-reviewer");
+            (.author.login) as $prauthor |
+            # the PR author replying in their own thread is not third-party
+            # review feedback and must not count toward "waiting on them"
+            (.reviews // [] | map(select(.author.login != $prauthor))) as $revs |
+            ($revs | map(select(.author.login | is_bot | not))
+                   | group_by(.author.login) | map({login: .[0].author.login, state: (last.state)})) as $human |
+            ($revs | map(select(.author.login | is_bot))
+                   | group_by(.author.login) | map({login: .[0].author.login, state: (last.state)})) as $bots |
+            [(.number // "?"), (.title // ""),
             ([.statusCheckRollup[]?.conclusion // .statusCheckRollup[]?.state] | map(select(.!=null))
              | if length==0 then "-"
                elif any(.=="FAILURE" or .=="ERROR" or .=="TIMED_OUT") then "FAIL"
@@ -76,10 +99,14 @@ fetch_pr() {
              else "-" end),
             ((.comments|length) + ([.reviews[]? | select(.body != "")] | length)),
             (.author.login // "-"),
-            # pending reviewers: users have .login, teams have .name/.slug
-            ([.reviewRequests[]? | .login // .slug // .name // empty] | join(",")),
+            # pending reviewers, humans only: users have .login, teams have .name/.slug
+            ([.reviewRequests[]? | ((.login // .slug // .name // empty)) | select((.|is_bot) | not)] | join(",")),
             # my own latest review state (empty if I never reviewed, or login unknown)
-            (if $login=="" then "" else ([.latestReviews[]? | select(.author.login==$login) | .state] | .[0] // "") end)
+            (if $login=="" then "" else ([.latestReviews[]? | select(.author.login==$login) | .state] | .[0] // "") end),
+            ($human | map("\(.login):\(.state)") | join(",")),
+            ($human | map(select(.state=="APPROVED")) | length),
+            ($bots | map("\(.login):\(.state)") | join(",")),
+            ([.reviewRequests[]? | ((.login // .slug // .name // empty)) | select(.|is_bot)] | join(","))
            ] | @tsv' > "$out" 2>/dev/null
 }
 
@@ -121,6 +148,9 @@ pad() {
   printf '%-*s' "$((w + b - c))" "$s"
 }
 
+# number of comma-separated items in a possibly-empty CSV string
+count_csv() { [ -z "$1" ] && { echo 0; return; }; local IFS=','; local -a a=($1); echo "${#a[@]}"; }
+
 # symbol maps for the indicator columns
 ci_sym()  { case "$1" in ok) echo "✓";; FAIL) echo "✗";; ...) echo "…";; *) echo "-";; esac; }
 mrg_sym() { case "$1" in ok) echo "✓";; confl) echo "✗confl";; behind) echo "↓behind";; no) echo "✗";; *) echo "$1";; esac; }
@@ -128,6 +158,7 @@ rev_sym() { case "$1" in appr) echo "✓";; me) echo "←me";; them) echo "→th
 sec_sym() { case "$1" in 0) echo "-";; *) echo "$1";; esac; }   # "$1" is a count, "?" (no scope), or 0
 # one colored letter for PR lifecycle: D draft, R ready, M merged, C closed
 st_sym()  { case "$1" in ready) echo "R";; draft) echo "D";; merged) echo "M";; closed) echo "C";; *) echo "?";; esac; }
+rtm_sym() { case "$1" in yes) echo "✓";; no) echo "✗";; *) echo "-";; esac; }   # ready-to-merge verdict
 
 # ANSI palette; colors wrap the already-padded field so escape codes (zero
 # display width) never enter pad()'s byte math.
@@ -139,6 +170,7 @@ st_col()  { case "$1" in ready) printf %s "$C_GRN";; draft) printf %s "$C_YEL";;
 rev_col() { case "$1" in appr) printf %s "$C_GRN";; me) printf %s "$C_RED";; them) printf %s "$C_YEL";; esac; }
 sec_col() { case "$1" in 0|'?') printf %s "$C_DIM";; *) printf %s "$C_RED";; esac; }   # any high/critical alert -> red
 sts_col() { case "$1" in working) printf %s "$C_GRN";; blocked) printf %s "$C_RED";; idle|done) printf %s "$C_DIM";; esac; }
+rtm_col() { case "$1" in yes) printf %s "$C_GRN";; no) printf %s "$C_RED";; *) printf %s "$C_DIM";; esac; }
 
 render() {
   local idx=0 hidden=0 discarded=0 agents pane agent status cwd url num title state checks out=""
@@ -268,15 +300,28 @@ render() {
       out+="  ${C_DIM}— your other open PRs —${C_RST}"$'\n'
     fi
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"; ROW_KIND[$idx]="${R_KIND[$idx]:-}"
-    local st mrg rev cmts author reviewers myrev rname revd revcol repo secn
-    IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers myrev < "$cache/${url//[:\/]/_}" 2>/dev/null || true
+    local st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending rname revd revcol repo secn rtm
+    IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending < "$cache/${url//[:\/]/_}" 2>/dev/null || true
     rname="${url#https://github.com/}"; repo="${rname%%/pull/*}"; rname="${rname#*/}"; rname="${rname%%/pull/*}"
     secn="$(cat "$cache/sec_${repo//\//_}" 2>/dev/null)"
     [[ "$secn" =~ ^[0-9]+$ ]] || secn='?'
-    # REVIEW shows WHO it waits on: →<first pending reviewer> instead of →them
+    # REVIEW shows WHO/WHAT it waits on. Single pending human reviewer -> their
+    # name; multiple humans involved (pending + already-reviewed) -> N/M
+    # approval count so "1 approved, 1 still out" is visible at a glance.
+    # Bot reviewers/requests never factor in here (filtered out in fetch_pr).
     revd="$(rev_sym "${rev:--}")"
     revcol="$rev"
-    [ "$rev" = them ] && [ -n "${reviewers:-}" ] && revd="→${reviewers%%,*}"
+    if [ "$rev" = them ]; then
+      local pend_n hum_n tot_n
+      pend_n="$(count_csv "$reviewers")"
+      hum_n="$(count_csv "$revdetail")"
+      tot_n=$((pend_n + hum_n))
+      if [ "$tot_n" -gt 1 ]; then
+        revd="→${apprcnt:-0}/${tot_n}"
+      elif [ "$pend_n" -ge 1 ]; then
+        revd="→${reviewers%%,*}"
+      fi
+    fi
     # "waiting for your review" rows: overall reviewDecision (appr/them) can't tell
     # you whether YOUR review specifically still blocks it — repos with multiple
     # required approvers can show REVIEW_REQUIRED even after you've approved.
@@ -289,12 +334,24 @@ render() {
         *) revd="→need"; revcol=them ;;                 # you haven't reviewed yet
       esac
     fi
-    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-2s%s %s%s%s %s%s%s %s%s%s %-12.12s %3s  %.32s\n' \
+    # RTM: the single "can I actually hit merge right now" verdict — mergeable,
+    # checks green (or none configured), not blocked on outstanding review, and
+    # published (not a draft). Merged/closed/draft PRs just show "-" (see ST).
+    rtm="-"
+    if [ "$st" = ready ]; then
+      if [ "$mrg" = ok ] && { [ "${checks:--}" = ok ] || [ "${checks:--}" = - ]; } && { [ "$rev" = appr ] || [ "$rev" = "-" ]; }; then
+        rtm=yes
+      else
+        rtm=no
+      fi
+    fi
+    printf -v line '  %-16.16s %s%-9s%s %3s  #%-6s %-14.14s %s%s%s %s%-2s%s %s%s%s %s%s%s %s%s%s %s%s%s %-12.12s %3s  %.32s\n' \
       "${R_AGENT[$idx]}" "$(sts_col "${R_STATUS[$idx]}")" "${R_STATUS[$idx]}" "$C_RST" "$idx" "${num:-?}" "$rname" \
       "$(ci_col "${checks:--}")"  "$(pad "$(ci_sym "${checks:--}")" 3)"  "$C_RST" \
       "$(st_col "${st:-?}")"      "$(st_sym "${st:-?}")"                 "$C_RST" \
       "$(mrg_col "${mrg:-?}")"    "$(pad "$(mrg_sym "${mrg:-?}")" 8)"    "$C_RST" \
       "$(rev_col "${revcol:--}")" "$(pad "${revd:0:14}" 14)"             "$C_RST" \
+      "$(rtm_col "$rtm")"         "$(pad "$(rtm_sym "$rtm")" 3)"         "$C_RST" \
       "$(sec_col "$secn")"        "$(pad "$(sec_sym "$secn")" 3)"        "$C_RST" \
       "${author:--}" "${cmts:-0}" "${title:-}"
     out+="$line"
@@ -305,7 +362,7 @@ render() {
 
   [ -n "${QUIET:-}" ] && return   # headless --triage: collect rows, draw nothing
   clear
-  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · d deps · ? help · r refresh · c checkout · m merge · p plan · x discard · u undiscard · w scope · q quit)%s\n' \
+  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · d deps · ? help · r refresh · c checkout · m merge · p plan · x discard · v review · u undiscard · w scope · q quit)%s\n' \
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
@@ -316,8 +373,8 @@ render() {
   else
     printf '  %sno custom verbs — add them to %s (? for help)%s\n' "$C_DIM" "$CMDS_FILE" "$C_RST"
   fi
-  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-2s %-8s %-14s %-3s %-12s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "SEC" "AUTHOR" "C" "TITLE" "$C_RST"
-  printf '  %s%s%s\n' "$C_DIM" "-----------------------------------------------------------------------------------------------------------------" "$C_RST"
+  printf '%s  %-16s %-9s %3s  %-7s %-14s %-3s %-2s %-8s %-14s %-3s %-3s %-12s %3s  %s%s\n' "$C_CYN$C_BLD" "AGENT" "STATUS" "N" "PR" "REPO" "CI" "ST" "MERGE" "REVIEW" "RTM" "SEC" "AUTHOR" "C" "TITLE" "$C_RST"
+  printf '  %s%s%s\n' "$C_DIM" "---------------------------------------------------------------------------------------------------------------------" "$C_RST"
   printf '%s' "$out"
 }
 
@@ -334,6 +391,7 @@ action_for() {
     checkout) (cd "${cwd:-.}" && gh pr checkout "$url") ;;
     merge)    (cd "${cwd:-.}" && gh pr merge "$url") ;;   # interactive; uses repo defaults
     plan)     local f="$PLANS_DIR/$(basename "$url").md"; ${EDITOR:-vi} "$f" ;;  # ponytail: pane stdout is a pipe, full-screen editors may warn; good enough
+    review)   show_review_detail "$n" ;;   # who's approved/pending/commented, bots called out separately
     discard)  # local-only "stop showing me this PR" — never touches GitHub; 'u' undoes
       printf '%s\n' "$url" >> "$STATE_DIR/discarded"
       sort -u "$STATE_DIR/discarded" -o "$STATE_DIR/discarded" ;;
@@ -361,6 +419,53 @@ action_for() {
       fi ;;
     spawn:*)  spawn_cc "$n" "${verb#spawn:}" ;;
   esac
+}
+
+# 'v': per-row breakdown of who's approved/pending/commented, so "them" with
+# multiple reviewers stops being a mystery. Bots are listed last and labeled
+# non-blocking — they can comment/request-changes but never satisfy a
+# required-approval branch rule.
+show_review_detail() {
+  local n="$1" url="${ROW_URL[$n]:-}" cache="$STATE_DIR/prcache"
+  [ -z "$url" ] && { printf '  row %s: no PR\n' "$n"; return; }
+  local num title checks st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending
+  IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending \
+    < "$cache/${url//[:\/]/_}" 2>/dev/null
+  printf '\n%s  review detail — #%s %s%s\n' "$C_BLD" "${num:-?}" "${title:-}" "$C_RST"
+  local any=0 entry login state col
+  if [ -n "$revdetail" ]; then
+    IFS=',' read -ra _e <<<"$revdetail"
+    for entry in "${_e[@]}"; do
+      login="${entry%%:*}"; state="${entry#*:}"; any=1
+      case "$state" in APPROVED) col=appr;; CHANGES_REQUESTED) col=me;; *) col=-;; esac
+      printf '    %s%-20s%s %s\n' "$(rev_col "$col")" "$login" "$C_RST" "$state"
+    done
+  fi
+  if [ -n "$reviewers" ]; then
+    IFS=',' read -ra _p <<<"$reviewers"
+    for login in "${_p[@]}"; do
+      any=1
+      printf '    %s%-20s%s %s\n' "$C_YEL" "$login" "$C_RST" "PENDING"
+    done
+  fi
+  if [ -n "$botdetail" ]; then
+    IFS=',' read -ra _b <<<"$botdetail"
+    for entry in "${_b[@]}"; do
+      login="${entry%%:*}"; state="${entry#*:}"; any=1
+      printf '    %s%-20s%s %s (bot — informational, does not block)%s\n' "$C_DIM" "$login" "$state" "$C_RST"
+    done
+  fi
+  if [ -n "$botpending" ]; then
+    IFS=',' read -ra _bp <<<"$botpending"
+    for login in "${_bp[@]}"; do
+      any=1
+      printf '    %s%-20s%s PENDING (bot — will never approve, does not block)%s\n' "$C_DIM" "$login" "$C_RST"
+    done
+  fi
+  [ "$any" = 0 ] && printf '    (no reviewers requested or submitted)\n'
+  printf '  %s%s human approval(s) · reviewDecision=%s%s\n' "$C_DIM" "${apprcnt:-0}" "${rev:-?}" "$C_RST"
+  printf '\n  press any key to return '
+  IFS= read -rsn1 -t 60 _ || true
 }
 
 # repos.conf: "owner/name = /path/to/local/clone" lines. When a PR's repo is
@@ -513,9 +618,10 @@ load_cmds
 
 # full help: keys, batch syntax, built-in verbs, and every loaded custom verb
 show_help() {
-  printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p/x then <n>+Enter checkout/merge/plan/discard · : batch · t triage · d dependabot/security sweep · r refresh · u undiscard all · w scope · q quit\n' "$C_BLD" "$C_RST"
+  printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p/x/v then <n>+Enter checkout/merge/plan/discard/review-detail · : batch · t triage · d dependabot/security sweep · r refresh · u undiscard all · w scope · q quit\n' "$C_BLD" "$C_RST"
   printf '%s  batch%s     :<row><verb>[,<row><verb>…]  e.g. ":1pr,2m,3r,4ar" — no verb = open, so ":1,2" opens two tabs\n' "$C_BLD" "$C_RST"
-  printf '%s  built-in%s  o open · c checkout · m merge · p plan · x discard (local-only, "u" undoes) · cc new workspace+claude on the PR (combine: ":10ccar" = cc, then run ar there)\n' "$C_BLD" "$C_RST"
+  printf '%s  built-in%s  o open · c checkout · m merge · p plan · x discard (local-only, "u" undoes) · v review detail (who approved/pending, bots called out) · cc new workspace+claude on the PR (combine: ":10ccar" = cc, then run ar there)\n' "$C_BLD" "$C_RST"
+  printf '%s  columns%s   REVIEW → single pending reviewer by name, or approved/total when several are involved · RTM = ready to merge right now (mergeable, checks green, not blocked on review)\n' "$C_BLD" "$C_RST"
   printf '%s  verbs%s     '"'"'@'"'"' = typed into the PR'"'"'s claude session · override defaults in %s:\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
   local v tag
   while IFS= read -r v; do
@@ -536,6 +642,7 @@ resolve_verb() {
     m)    echo merge ;;
     p)    echo plan ;;
     x)    echo discard ;;   # locally hide this PR from the board; 'u' undiscards all
+    v)    echo review ;;    # who's approved/pending/commented on this PR (bots called out)
     cc*)  # spawn a fresh workspace+claude for the PR; optional follow-up verb ("ccar")
       local f="${1#cc}"
       if [ -z "$f" ] || [ -n "${CMDS[$f]:-}" ]; then echo "spawn:$f"; else return 1; fi ;;
@@ -771,6 +878,7 @@ while :; do
       m) PENDING_VERB="merge";    printf '\r  [merge] type row number + Enter … '    ;;
       p) PENDING_VERB="plan";     printf '\r  [plan] type row number + Enter … '     ;;
       x) PENDING_VERB="discard";  printf '\r  [discard] type row number + Enter … '  ;;
+      v) PENDING_VERB="review";   printf '\r  [review] type row number + Enter … '   ;;
       :)  # explicit command line: "1,2c,3m" + Enter runs each token in order
         printf '\r  cmd> '
         if read_editable ""; then
