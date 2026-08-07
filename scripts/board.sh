@@ -62,8 +62,18 @@ fetch_pr() {
   local url="$1" out="$2"
   gh pr view "$url" --json number,title,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,comments,reviews,author,reviewRequests,latestReviews 2>/dev/null \
   | jq -r --arg login "$MY_LOGIN" '
-            def is_bot: (. // "") | endswith("[bot]");
-            (.reviews // []) as $revs |
+            # ponytail: gh CLI flattens review authors to a bare login with no
+            # type info, so bot detection is pattern-matching, not a real
+            # "__typename==Bot" check (that needs a raw GraphQL call per PR).
+            # Known offenders that do not follow the "[bot]" convention are
+            # listed explicitly; upgrade to GraphQL author.__typename if more
+            # show up.
+            def is_bot: (. // "") | (endswith("[bot]") or endswith("-bot")
+                         or . == "copilot-pull-request-reviewer");
+            (.author.login) as $prauthor |
+            # the PR author replying in their own thread is not third-party
+            # review feedback and must not count toward "waiting on them"
+            (.reviews // [] | map(select(.author.login != $prauthor))) as $revs |
             ($revs | map(select(.author.login | is_bot | not))
                    | group_by(.author.login) | map({login: .[0].author.login, state: (last.state)})) as $human |
             ($revs | map(select(.author.login | is_bot))
