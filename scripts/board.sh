@@ -115,7 +115,12 @@ fetch_pr() {
             ($human | map(select(.state=="APPROVED")) | length),
             ($bots | map("\(.login):\(.state)") | join(",")),
             ([.reviewRequests[]? | ((.login // .slug // .name // empty)) | select(.|is_bot)] | join(","))
-           ] | @tsv' > "$out" 2>/dev/null
+           ] | @tsv' | tr $'\t' $'\x1f' > "$out" 2>/dev/null
+  # bash `read` treats tab as IFS-whitespace no matter how IFS is set, so
+  # consecutive tabs (an empty middle field, e.g. myrev when you have not
+  # reviewed) collapse and shift every field after it. @tsv still does the
+  # jq-side escaping of embedded tabs/newlines within a field; only the
+  # delimiter itself is swapped to a byte bash will not treat as whitespace.
 }
 
 # count open High/Critical security findings for one repo (owner/name), summed
@@ -309,7 +314,7 @@ render() {
     fi
     url="${R_URL[$idx]}"; ROW_URL[$idx]="$url"; ROW_CWD[$idx]="${R_CWD[$idx]}"; ROW_PANE[$idx]="${R_PANE[$idx]}"; ROW_STATUS[$idx]="${R_STATUS[$idx]}"; ROW_KIND[$idx]="${R_KIND[$idx]:-}"
     local st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending rname revd revcol repo secn rtm
-    IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending < "$cache/${url//[:\/]/_}" 2>/dev/null || true
+    IFS=$'\x1f' read -r num title checks st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending < "$cache/${url//[:\/]/_}" 2>/dev/null || true
     rname="${url#https://github.com/}"; repo="${rname%%/pull/*}"; rname="${rname#*/}"; rname="${rname%%/pull/*}"
     secn="$(cat "$cache/sec_${repo//\//_}" 2>/dev/null)"
     [[ "$secn" =~ ^[0-9]+$ ]] || secn='?'
@@ -453,7 +458,7 @@ show_review_detail() {
   local n="$1" url="${ROW_URL[$n]:-}" cache="$STATE_DIR/prcache"
   [ -z "$url" ] && { printf '  row %s: no PR\n' "$n"; return; }
   local num title checks st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending
-  IFS=$'\t' read -r num title checks st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending \
+  IFS=$'\x1f' read -r num title checks st mrg rev cmts author reviewers myrev revdetail apprcnt botdetail botpending \
     < "$cache/${url//[:\/]/_}" 2>/dev/null
   printf '\n%s  review detail — #%s %s%s\n' "$C_BLD" "${num:-?}" "${title:-}" "$C_RST"
   local any=0 entry login state col
@@ -790,7 +795,7 @@ triage() {
   printf '\n%s  triage:%s\n' "$C_BLD" "$C_RST"
   for ((idx=1; idx<=${#ROW_URL[@]}; idx++)); do
     url="${ROW_URL[$idx]:-}"; [ -z "$url" ] && continue
-    IFS=$'\t' read -r num title ci st mrg rev cmts author reviewers < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
+    IFS=$'\x1f' read -r num title ci st mrg rev cmts author reviewers < "$cache/${url//[:\/]/_}" 2>/dev/null || continue
     verb="$(suggest_verb "${ci:--}" "${st:-?}" "${mrg:-?}" "${rev:--}" "${ROW_KIND[$idx]:-}")"
     # session-less row + session-bound verb: suggest spawning a session first
     if [ -n "$verb" ] && [ -z "${ROW_PANE[$idx]:-}" ] && [[ "${CMDS[$verb]:-}" == @* ]]; then verb="cc$verb"; fi
