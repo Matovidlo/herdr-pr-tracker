@@ -74,8 +74,16 @@ fetch_pr() {
             # the PR author replying in their own thread is not third-party
             # review feedback and must not count toward "waiting on them"
             (.reviews // [] | map(select(.author.login != $prauthor))) as $revs |
+            # a reviewer displayed state must match reviewDecision own logic:
+            # GitHub keeps CHANGES_REQUESTED/APPROVED standing until that reviewer
+            # submits another formal verdict; extra COMMENTED-only reviews (a
+            # follow-up pass, inline replies) do not clear it. Taking the bare
+            # last review here would show COMMENTED while reviewDecision still
+            # says CHANGES_REQUESTED, exactly the mismatch we are fixing.
+            def formal_state: (map(select(.state=="APPROVED" or .state=="CHANGES_REQUESTED"))) as $f
+                               | if ($f|length) > 0 then $f[-1].state else .[-1].state end;
             ($revs | map(select(.author.login | is_bot | not))
-                   | group_by(.author.login) | map({login: .[0].author.login, state: (last.state)})) as $human |
+                   | group_by(.author.login) | map({login: .[0].author.login, state: (formal_state)})) as $human |
             ($revs | map(select(.author.login | is_bot))
                    | group_by(.author.login) | map({login: .[0].author.login, state: (last.state)})) as $bots |
             [(.number // "?"), (.title // ""),
@@ -321,6 +329,22 @@ render() {
       elif [ "$pend_n" -ge 1 ]; then
         revd="→${reviewers%%,*}"
       fi
+    fi
+    # reviewDecision=CHANGES_REQUESTED sticks until that reviewer submits a
+    # fresh APPROVE/CHANGES_REQUESTED — GitHub doesn't clear it on a re-request
+    # or on later COMMENTED-only reviews. But once you've re-requested review
+    # from the very person who's blocking it, the ball is on them, not you —
+    # surface that instead of leaving a stale "←me".
+    if [ "$rev" = me ] && [ -n "$revdetail" ] && [ -n "$reviewers" ]; then
+      local entry rlogin rstate
+      IFS=',' read -ra _rd <<<"$revdetail"
+      for entry in "${_rd[@]}"; do
+        rlogin="${entry%%:*}"; rstate="${entry#*:}"
+        [ "$rstate" = CHANGES_REQUESTED ] || continue
+        case ",$reviewers," in
+          *",$rlogin,"*) revd="→${rlogin}"; revcol=them; break ;;
+        esac
+      done
     fi
     # "waiting for your review" rows: overall reviewDecision (appr/them) can't tell
     # you whether YOUR review specifically still blocks it — repos with multiple
