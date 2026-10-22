@@ -638,7 +638,6 @@ spawn_agent_session() {
     else
       "$HERDR" pane run "$pane" "$payload" >/dev/null 2>&1 && send_ok=1
     fi
-    sleep 1
     if [ "$send_ok" = 1 ]; then
       printf '  row %s: sent %s to the new session\n' "$n" "$follow"
     else
@@ -655,19 +654,21 @@ spawn_cc() {
   spawn_agent_session "$1" "$2" claude claude "" claude "${args[@]}"
 }
 
+# Single source of truth for the read-only Codex review profile (sets REVIEW_ARGS).
+codex_review_args() {
+  load_review_models
+  REVIEW_ARGS=(--model "$REVIEW_CODEX_MODEL" --config "model_reasoning_effort=$REVIEW_CODEX_EFFORT"
+    --sandbox read-only --ask-for-approval never)
+}
+
 spawn_coc() {
   local -a args=()
   [ -n "${HERDR_COC_CODEX_ARGS:-}" ] && read -r -a args <<<"$HERDR_COC_CODEX_ARGS"
   if [ "${2:-}" = cr ]; then
-    load_review_models
-    args+=(--model "$REVIEW_CODEX_MODEL" --config "model_reasoning_effort=$REVIEW_CODEX_EFFORT"
-      --sandbox read-only --ask-for-approval never)
+    codex_review_args
+    args+=("${REVIEW_ARGS[@]}")
   fi
   spawn_agent_session "$1" "$2" codex codex "" codex "${args[@]}"
-}
-
-spawn_co() {
-  spawn_coc "$1" "$2"
 }
 
 load_review_models() {
@@ -708,11 +709,9 @@ spawn_review_pair() {
   repo="${url#https://github.com/}"; repo="${repo%%/pull/*}"
   codex_review_dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num-review-codex"
   claude_review_dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num-review-claude"
-  load_review_models
+  codex_review_args
   printf '  row %s: starting read-only Codex (%s, %s effort) and Claude Code (%s) reviews\n' "$n" "$REVIEW_CODEX_MODEL" "$REVIEW_CODEX_EFFORT" "$REVIEW_CLAUDE_MODEL"
-  spawn_agent_session "$n" cr codex codex review-codex codex \
-    --model "$REVIEW_CODEX_MODEL" --config "model_reasoning_effort=$REVIEW_CODEX_EFFORT" \
-    --sandbox read-only --ask-for-approval never
+  spawn_agent_session "$n" cr codex codex review-codex codex "${REVIEW_ARGS[@]}"
   common_git_dir="$(git -C "$codex_review_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   if [ -z "$common_git_dir" ]; then
     printf '  row %s: cannot locate the shared Git directory; Claude review was not started\n' "$n"
