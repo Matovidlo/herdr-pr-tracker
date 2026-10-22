@@ -391,13 +391,13 @@ render() {
 
   [ -n "${QUIET:-}" ] && return   # headless --triage: collect rows, draw nothing
   clear
-  printf '%s  Claude PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · d deps · ? help · r refresh · c checkout · m merge · p plan · x discard · v review · u undiscard · w scope · q quit)%s\n' \
+  printf '%s  PR Tracker%s [%s]  %s(number+Enter open · : cmdline "1,2c,3m" · t triage · d deps · ? help · r refresh · c checkout · m merge · p plan · x discard · v review · u undiscard · w scope · q quit)%s\n' \
     "$C_BLD" "$C_RST" \
     "$( [ "$SCOPE" = ws ] && echo "workspace ${HERDR_WORKSPACE_ID:-?}" || echo "all sessions" )" \
     "$C_DIM" "$C_RST"
   # surface the loaded custom verbs so ":1pr,2ar" possibilities are discoverable
   if [ ${#CMDS[@]} -gt 0 ]; then
-    printf '  %sverbs: o c m p cc + %s  (? shows templates)%s\n' "$C_DIM" \
+    printf '  %sverbs: o c m p cc co cccocr + %s  (? shows templates)%s\n' "$C_DIM" \
       "$(printf '%s\n' "${!CMDS[@]}" | sort | tr '\n' ' ')" "$C_RST"
   else
     printf '  %sno custom verbs — add them to %s (? for help)%s\n' "$C_DIM" "$CMDS_FILE" "$C_RST"
@@ -433,10 +433,10 @@ action_for() {
       tmpl="${tmpl//\{cwd\}/$cwd}"
       tmpl="${tmpl//\{repo\}/$repo}"
       if [[ "$tmpl" == @* ]]; then
-        # '@' templates are typed INTO the PR's own claude session (visible in
+        # '@' templates are typed INTO the PR's own coding-agent session (visible in
         # its pane, uses its context) instead of running here.
         local pane="${ROW_PANE[$n]:-}" sts="${ROW_STATUS[$n]:-}"
-        [ -z "$pane" ] && { printf '  row %s: no claude session — use ":%scc%s" to spawn one\n' "$n" "$n" "${verb#cmd:}"; return; }
+        [ -z "$pane" ] && { printf '  row %s: no session — use ":%sco%s" (Codex), ":%scc%s" (Claude Code), or ":%scccocr" (both reviewers)\n' "$n" "$n" "${verb#cmd:}" "$n" "${verb#cmd:}" "$n"; return; }
         if [ "$sts" = working ]; then
           printf '  row %s: session is busy (working) — skipped, retry when idle\n' "$n"; return
         fi
@@ -447,6 +447,8 @@ action_for() {
         (cd "${cwd:-.}" && bash -c "$tmpl")
       fi ;;
     spawn:*)  spawn_cc "$n" "${verb#spawn:}" ;;
+    spawn-codex:*) spawn_coc "$n" "${verb#spawn-codex:}" ;;
+    spawn-both-review) spawn_review_pair "$n" ;;
   esac
 }
 
@@ -518,18 +520,20 @@ local_src() {
 # keboola/ui = ~/gt/kbc-ui
 EOF
 
-# 'cc' verb: attach a fresh claude session to a PR in its own herdr workspace.
+# 'cc'/'co' verbs: attach a fresh Claude Code or Codex session to a PR in its own herdr workspace.
 # Checks out the PR into a per-PR dir (worktree of your mapped clone from
 # repos.conf, else a full clone; reused on later calls), spawns workspace +
-# claude, and optionally types a follow-up verb's template into the new
+# the coding agent, and optionally types a follow-up verb's template into the new
 # session (":10ccar").
-spawn_cc() {
-  local n="$1" follow="$2"
-  local url="${ROW_URL[$n]:-}" num repo dir out wsid pane root
+spawn_agent_session() {
+  local n="$1" follow="$2" agent="$3" cli="$4" checkout_tag="$5" kind="$6"
+  shift 6
+  local -a args=("$@")
+  local url="${ROW_URL[$n]:-}" num repo dir out wsid pane root start_help start_name prompt_help process_info close_root=1
   [ -z "$url" ] && return
   num="${url##*/}"
   repo="${url#https://github.com/}"; repo="${repo%%/pull/*}"
-  dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num"
+  dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num${checkout_tag:+-$checkout_tag}"
   # worktrees have a .git *file*, clones a .git dir — -e covers both
   if [ ! -e "$dir/.git" ]; then
     local src; src="$(local_src "$repo")"
@@ -551,24 +555,69 @@ spawn_cc() {
     git -C "$src" worktree add --detach "$dir" >/dev/null 2>&1 || { printf 'worktree add failed\n'; return; }
     printf 'ok\n'
   fi
-  (cd "$dir" && gh pr checkout "$url" >/dev/null 2>&1) || { printf '  row %s: gh pr checkout failed in %s\n' "$n" "$dir"; return; }
-  out="$("$HERDR" workspace create --cwd "$dir" --label "PR #$num" --no-focus 2>/dev/null)"
+  local err
+  if ! err="$(cd "$dir" && gh pr checkout "$url" 2>&1)"; then
+    # reused worktree + force-pushed PR branch = "Not possible to fast-forward".
+    # ponytail: reset to the PR head unless tracked files are dirty; old commits stay in the reflog
+    if [ -n "$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+      printf '  row %s: gh pr checkout failed, %s has uncommitted changes: %s\n' "$n" "$dir" "$(tail -1 <<<"$err")"; return
+    fi
+    # branch already checked out in a sibling worktree (e.g. an older PR on the same branch): detach at the PR head instead
+    local flag=--force; [[ "$err" == *"already checked out"* || "$err" == *"already used by worktree"* ]] && flag=--detach
+    err="$(cd "$dir" && gh pr checkout "$flag" "$url" 2>&1)" || { printf '  row %s: gh pr checkout failed in %s: %s\n' "$n" "$dir" "$(tail -1 <<<"$err")"; return; }
+  fi
+  out="$("$HERDR" workspace create --cwd "$dir" --label "PR #$num${checkout_tag:+ $checkout_tag}" --no-focus 2>/dev/null)"
   wsid="$(jq -r '.result.workspace.workspace_id // empty' <<<"$out" 2>/dev/null)"
   root="$(jq -r '.result.root_pane.pane_id // empty' <<<"$out" 2>/dev/null)"
   [ -z "$wsid" ] && { printf '  row %s: workspace create failed\n' "$n"; return; }
-  # agent names are unique server-wide — a second cc with the name "claude"
-  # would die with agent_name_taken, so key the name to the workspace
-  out="$("$HERDR" agent start "claude-$wsid" --workspace "$wsid" --cwd "$dir" --focus -- claude 2>/dev/null)"
-  pane="$(jq -r '.result.agent.pane_id // empty' <<<"$out" 2>/dev/null)"
-  if [ -z "$pane" ]; then
-    printf '  row %s: agent start failed: %s\n' "$n" "$(jq -r '.error.message // "unknown error"' <<<"$out" 2>/dev/null)"
+  # Herdr 0.9+ starts an agent in the workspace's existing root pane; 0.7 used
+  # --workspace/--cwd and created a second pane. Keep both CLI generations
+  # working because plugin users may not update Herdr alongside the plugin.
+  # Workspace IDs can contain uppercase letters; Herdr agent names cannot.
+  start_name="${agent}-${wsid,,}"
+  start_name="${start_name//[^a-z0-9_-]/-}"
+  start_help="$("$HERDR" agent start --help 2>&1)"
+  if [[ "$start_help" == *"--pane"* && "$start_help" == *"--kind"* ]]; then
+    # workspace create can return before the root shell reaches its prompt.
+    # agent start rejects panes whose shell is not yet the foreground process.
+    local try shell_ready=0
+    for try in {1..60}; do
+      process_info="$("$HERDR" pane process-info --pane "$root" 2>/dev/null)"
+      if jq -e '.result.process_info as $p | ($p.shell_pid != null) and any($p.foreground_processes[]?; .pid == $p.shell_pid)' <<<"$process_info" >/dev/null 2>&1; then
+        shell_ready=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ "$shell_ready" = 0 ]; then
+      printf '  row %s: workspace %s root pane never reached a shell prompt; workspace retained for inspection\n' "$n" "$wsid"
+      return
+    fi
+    # ponytail: shell is foreground but zle may still be initializing; the first typed char got dropped ("odex"). Fixed 1s settle, poll for a prompt if it still races.
+    sleep 1
+    # --kind already selects the executable; only pass agent-specific args.
+    out="$("$HERDR" agent start "$start_name" --kind "$kind" --pane "$root" -- "${args[@]}" 2>&1)"
+    close_root=0
+  elif [[ "$start_help" == *"--workspace"* ]]; then
+    # Preserve stderr: it contains startup failures such as a missing CLI.
+    out="$("$HERDR" agent start "$start_name" --workspace "$wsid" --cwd "$dir" --focus -- "$cli" "${args[@]}" 2>&1)"
+  else
+    printf '  row %s: unsupported Herdr agent start interface\n' "$n"
     "$HERDR" workspace close "$wsid" >/dev/null 2>&1
     return
   fi
-  # workspace create spawns a root shell pane and agent start adds its own,
-  # leaving a 2-pane split — close the shell so only the claude pane remains
-  [ -n "$root" ] && "$HERDR" pane close "$root" >/dev/null 2>&1
-  printf '  row %s: claude started in workspace %s (%s)\n' "$n" "$wsid" "$dir"
+  pane="$(jq -r '.result.agent.pane_id // empty' <<<"$out" 2>/dev/null)"
+  if [ -z "$pane" ]; then
+    local start_message
+    start_message="$(jq -r '.error.message // .message // empty' <<<"$out" 2>/dev/null)"
+    [ -n "$start_message" ] || start_message="${out:-unknown error}"
+    printf '  row %s: agent start failed: %s (workspace %s retained for inspection)\n' "$n" "${start_message//$'\n'/; }" "$wsid"
+    return
+  fi
+  # Older Herdr created a second pane; close its initial shell. Newer Herdr
+  # replaces the root shell directly, so that pane is the agent pane.
+  [ "$close_root" = 1 ] && [ -n "$root" ] && "$HERDR" pane close "$root" >/dev/null 2>&1
+  printf '  row %s: %s started in workspace %s (%s)\n' "$n" "$cli" "$wsid" "$dir"
   [ -z "$follow" ] && return
   local tmpl="${CMDS[$follow]:-}"
   tmpl="${tmpl//\{url\}/$url}"
@@ -577,27 +626,109 @@ spawn_cc() {
   tmpl="${tmpl//\{repo\}/$repo}"
   if [[ "$tmpl" == @* ]]; then
     [ -z "$pane" ] && { printf '  row %s: no pane id — run "%s" manually\n' "$n" "$follow"; return; }
-    # let claude boot before typing the prompt
+    # Let the coding agent boot before sending the prompt. Submit exactly once:
+    # pane output is not a reliable acknowledgement, and retrying based on a
+    # missing echo can submit the same prompt twice.
     "$HERDR" agent wait "$pane" --status idle --timeout 90000 >/dev/null 2>&1
-    # agent_status flips to idle before Claude's own stdin reader attaches, so
-    # typing right away drops the first prompt on the floor (root cause of
-    # "ccar" needing a manual "ar" afterwards). Give it a beat, then verify
-    # the text actually landed in the pane and retry once if it didn't.
-    local payload="${tmpl#@}" sent=0 try
-    for try in 1 2; do
-      sleep 2
-      "$HERDR" pane run "$pane" "$payload" >/dev/null 2>&1
-      sleep 1
-      "$HERDR" pane read "$pane" --source recent --lines 40 2>/dev/null | grep -qF "${payload:0:20}" && { sent=1; break; }
-    done
-    if [ "$sent" = 1 ]; then
+    local payload="${tmpl#@}" send_ok=0
+    sleep 3
+    prompt_help="$("$HERDR" agent prompt --help 2>&1)"
+    if [[ "$prompt_help" == *"Usage: herdr agent prompt"* ]]; then
+      "$HERDR" agent prompt "$pane" "$payload" >/dev/null 2>&1 && send_ok=1
+    else
+      "$HERDR" pane run "$pane" "$payload" >/dev/null 2>&1 && send_ok=1
+    fi
+    if [ "$send_ok" = 1 ]; then
       printf '  row %s: sent %s to the new session\n' "$n" "$follow"
     else
-      printf '  row %s: failed to send %s — retry manually with ":%s%s"\n' "$n" "$follow" "$n" "$follow"
+      printf '  row %s: could not submit %s — inspect the new session before retrying ":%s%s"\n' "$n" "$follow" "$n" "$follow"
     fi
   else
     (cd "$dir" && bash -c "$tmpl")
   fi
+}
+
+spawn_cc() {
+  local -a args=()
+  [ -n "${HERDR_CC_CLAUDE_ARGS:-}" ] && read -r -a args <<<"$HERDR_CC_CLAUDE_ARGS"
+  spawn_agent_session "$1" "$2" claude claude "" claude "${args[@]}"
+}
+
+# Single source of truth for the read-only Codex review profile (sets REVIEW_ARGS).
+codex_review_args() {
+  load_review_models
+  REVIEW_ARGS=(--model "$REVIEW_CODEX_MODEL" --config "model_reasoning_effort=$REVIEW_CODEX_EFFORT"
+    --sandbox read-only --ask-for-approval never)
+}
+
+spawn_coc() {
+  local -a args=()
+  [ -n "${HERDR_COC_CODEX_ARGS:-}" ] && read -r -a args <<<"$HERDR_COC_CODEX_ARGS"
+  if [ "${2:-}" = cr ]; then
+    codex_review_args
+    args+=("${REVIEW_ARGS[@]}")
+  fi
+  spawn_agent_session "$1" "$2" codex codex "" codex "${args[@]}"
+}
+
+load_review_models() {
+  local models_file="$STATE_DIR/review-models.conf" key value
+  [ -f "$models_file" ] || cat > "$models_file" <<'EOF'
+# Model IDs or aliases supported by your installed agent CLIs.
+# Edit these per machine; the interactive agents can also change models later.
+# Codex examples: gpt-6.1-sol, gpt-5.6. Claude aliases: sonnet, opus, haiku.
+CODEX_MODEL=gpt-6.1-sol
+CODEX_REASONING_EFFORT=medium
+CLAUDE_MODEL=sonnet
+EOF
+  REVIEW_CODEX_MODEL="gpt-6.1-sol"
+  REVIEW_CODEX_EFFORT="medium"
+  REVIEW_CLAUDE_MODEL="sonnet"
+  while IFS='=' read -r key value; do
+    key="${key//[[:space:]]/}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      CODEX_MODEL) [ -n "$value" ] && REVIEW_CODEX_MODEL="$value" ;;
+      CODEX_REASONING_EFFORT) [ -n "$value" ] && REVIEW_CODEX_EFFORT="$value" ;;
+      CLAUDE_MODEL) [ -n "$value" ] && REVIEW_CLAUDE_MODEL="$value" ;;
+    esac
+  done < <(grep -v '^[[:space:]]*#' "$models_file" 2>/dev/null)
+}
+
+spawn_review_pair() {
+  local n="$1"
+  local url="${ROW_URL[$n]:-}" repo num codex_review_dir claude_review_dir common_git_dir claude_sandbox_settings
+  local cr_tmpl="${CMDS[cr]:-}"
+  if [[ "$cr_tmpl" != @* ]]; then
+    printf '  row %s: combined review needs cr to be an @ prompt in %s\n' "$n" "$CMDS_FILE"
+    return
+  fi
+  [ -z "$url" ] && return
+  num="${url##*/}"
+  repo="${url#https://github.com/}"; repo="${repo%%/pull/*}"
+  codex_review_dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num-review-codex"
+  claude_review_dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num-review-claude"
+  codex_review_args
+  printf '  row %s: starting read-only Codex (%s, %s effort) and Claude Code (%s) reviews\n' "$n" "$REVIEW_CODEX_MODEL" "$REVIEW_CODEX_EFFORT" "$REVIEW_CLAUDE_MODEL"
+  spawn_agent_session "$n" cr codex codex review-codex codex "${REVIEW_ARGS[@]}"
+  common_git_dir="$(git -C "$codex_review_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  if [ -z "$common_git_dir" ]; then
+    printf '  row %s: cannot locate the shared Git directory; Claude review was not started\n' "$n"
+    return
+  fi
+  claude_sandbox_settings="$(jq -cn --arg dir "$claude_review_dir" --arg gitdir "$common_git_dir" \
+    '{sandbox:{enabled:true,allowUnsandboxedCommands:false,failIfUnavailable:true,filesystem:{denyWrite:[$dir,$gitdir]}}}')"
+  spawn_agent_session "$n" cr claude claude review-claude claude \
+    --model "$REVIEW_CLAUDE_MODEL" --permission-mode plan --restricted \
+    --tools 'Bash,Read,Glob,Grep' \
+    --settings "$claude_sandbox_settings" \
+    --disallowedTools Edit Write NotebookEdit 'mcp__*' \
+    'Bash(git add *)' 'Bash(git checkout *)' 'Bash(git branch *)' \
+    'Bash(git cherry-pick *)' 'Bash(git clean *)' 'Bash(git commit *)' \
+    'Bash(git fetch *)' 'Bash(git push *)' 'Bash(git rebase *)' \
+    'Bash(git remote *)' 'Bash(git reset *)' 'Bash(git tag *)' \
+    'Bash(git worktree *)' 'Bash(gh *)'
 }
 
 # user-defined verbs: "<verb> = <command template>" lines in commands.conf.
@@ -607,13 +738,13 @@ declare -A CMDS
 # Built-in default verbs — generic, no personal skills required. Any line in
 # commands.conf with the same verb name overrides the default.
 declare -A DEFAULT_CMDS=(
-  [pr]='@Review PR {url}: review only the changed code (the diff), rank findings by severity with exact file:line, be concrete about fixes, and present a findings table — do not post to GitHub without approval.'
+  [pr]='@Review PR {url}: use only the checked-out branch and local git data; do not run gh, access the network, or post to GitHub. Review only the changed code (the diff), rank findings by severity with exact file:line, be concrete about fixes, and present a findings table.'
   [ar]='@Address the review comments on PR {url}: read all unresolved review and bot comments, implement the fixes, push, and reply to each comment.'
   [r]='@Rebase PR {url} on its base branch, resolve any conflicts, and push with --force-with-lease.'
   [rs]='@CI on PR {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green.'
   [s]='@/simplify'
   [pub]='gh pr ready {url}'
-  [cr]='@Conduct a code review of PR {url} as the requested reviewer: study the full diff, check correctness, tests, and maintainability, rank findings by severity with exact file:line, and present a findings table — do not submit the review to GitHub without approval.'
+  [cr]='@Conduct a read-only code review of PR {url} as the requested reviewer: use only the checked-out branch and local git data. Do not run gh, access the network, run tests, change files, write a plan/scratch file, submit the review to GitHub, or depend on skills/subagents. If a requested skill or agent tool is unavailable, perform its review lens inline and label it accordingly. Study the full diff and existing tests, assess correctness, test coverage, and maintainability, rank findings by severity with exact file:line, and present a findings table.'
   [fin]='@Take over PR {url} and finish it: read the discussion and unresolved review comments, address them, fix any failing CI, rebase on the base branch if needed, and push until the PR is green and ready to merge.'
   [dep]='@Wrap up dependabot and security compliance for {repo}: list all open dependabot PRs and open dependabot alerts (critical/high first), merge or combine the safe bumps, fix what the alerts require, and report anything that needs manual attention.'
 )
@@ -635,7 +766,7 @@ load_cmds() {
 # name overrides the default. '?' on the board lists the effective set.
 #
 # <verb> = <command template>; runs in the PR's session cwd.
-# Prefix the template with '@' to type it into the PR's own claude session
+# Prefix the template with '@' to type it into the PR's own coding-agent session
 # instead (skipped while that session is working).
 # Placeholders: {url} {num} {cwd} {repo}
 # pr  = @/prreview {url}
@@ -647,11 +778,13 @@ load_cmds
 
 # full help: keys, batch syntax, built-in verbs, and every loaded custom verb
 show_help() {
+  load_review_models
   printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p/x/v then <n>+Enter checkout/merge/plan/discard/review-detail · : batch · t triage · d dependabot/security sweep · r refresh · u undiscard all · w scope · q quit\n' "$C_BLD" "$C_RST"
   printf '%s  batch%s     :<row><verb>[,<row><verb>…]  e.g. ":1pr,2m,3r,4ar" — no verb = open, so ":1,2" opens two tabs\n' "$C_BLD" "$C_RST"
-  printf '%s  built-in%s  o open · c checkout · m merge · p plan · x discard (local-only, "u" undoes) · v review detail (who approved/pending, bots called out) · cc new workspace+claude on the PR (combine: ":10ccar" = cc, then run ar there)\n' "$C_BLD" "$C_RST"
+  printf '%s  built-in%s  o open · c checkout · m merge · p plan · x discard · v review detail · cc Claude Code · co Codex · cccocr read-only review in both (separate worktrees)\n' "$C_BLD" "$C_RST"
+  printf '%s  review models%s Codex=%s (%s effort) · Claude Code=%s (edit %s/review-models.conf)\n' "$C_BLD" "$C_RST" "$REVIEW_CODEX_MODEL" "$REVIEW_CODEX_EFFORT" "$REVIEW_CLAUDE_MODEL" "$STATE_DIR"
   printf '%s  columns%s   REVIEW → single pending reviewer by name, or approved/total when several are involved · RTM = ready to merge right now (mergeable, checks green, not blocked on review)\n' "$C_BLD" "$C_RST"
-  printf '%s  verbs%s     '"'"'@'"'"' = typed into the PR'"'"'s claude session · override defaults in %s:\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
+  printf '%s  verbs%s     '"'"'@'"'"' = typed into the PR'"'"'s coding-agent session · override defaults in %s:\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
   local v tag
   while IFS= read -r v; do
     tag="custom "
@@ -672,7 +805,12 @@ resolve_verb() {
     p)    echo plan ;;
     x)    echo discard ;;   # locally hide this PR from the board; 'u' undiscards all
     v)    echo review ;;    # who's approved/pending/commented on this PR (bots called out)
-    cc*)  # spawn a fresh workspace+claude for the PR; optional follow-up verb ("ccar")
+    cccocr|coccr) echo spawn-both-review ;;
+    coc)  echo spawn-codex: ;; # backwards-compatible Codex alias
+    co*)  # spawn Codex; optional follow-up verb ("cocr" = Codex + code review)
+      local f="${1#co}"
+      if [ -z "$f" ] || [ -n "${CMDS[$f]:-}" ]; then echo "spawn-codex:$f"; else return 1; fi ;;
+    cc*)  # spawn Claude Code in a fresh workspace; optional follow-up verb ("ccar")
       local f="${1#cc}"
       if [ -z "$f" ] || [ -n "${CMDS[$f]:-}" ]; then echo "spawn:$f"; else return 1; fi ;;
     *)    [ -n "${CMDS[$1]:-}" ] && echo "cmd:$1" || return 1 ;;

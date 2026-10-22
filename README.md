@@ -1,7 +1,7 @@
 # herdr-pr-tracker
 
 A [herdr](https://herdr.dev) plugin that tracks the GitHub PR each Claude Code
-session produces, in its own herdr window — with live `gh` state and a few actions.
+or Codex session produces, in its own herdr window — with live `gh` state and a few actions.
 
 It polls `herdr agent list`, finds the PR for each session (scrapes the pane's
 recent output for a `…/pull/N` URL, falling back to `gh pr list --head <branch>`),
@@ -64,17 +64,20 @@ the `d` sweep owns repo-level dependency hygiene. The AUTHOR column and the
 reviewer name in REVIEW show whose PR it is and who it waits on. Two verbs target them:
 
 - `cr` — **conduct the code review** (the usual case): findings table with
-  file:line, ranked by severity, never posted to GitHub without approval.
+  file:line, ranked by severity. The built-in prompt uses the checked-out
+  branch and local Git data only; it does not call `gh` or access the network.
+  Findings are never posted to GitHub.
 - `fin` — **take the PR over** when the author is away: address the open
   review comments, fix CI, rebase, push until it's ready to merge.
 
-Both are `@` verbs, so on these session-less rows combine with `cc`:
-`:5cccr` spawns a workspace + claude on the PR and starts the review.
+Both are `@` verbs, so on these session-less rows combine with an agent launcher:
+`:5cccr` starts Claude Code for the review; `:5cocr` starts Codex. Use
+`:5cccocr` to start both reviewers in parallel.
 Override either in `commands.conf` to use your own review skill, e.g.
 `cr = @/thermo-nuclear-code-quality-review {url}`.
 
 ### Rows without a session (your authored/assigned PRs) — opt-in
-Besides the PRs of running claude sessions, the board can append **every open
+Besides the PRs of running coding-agent sessions, the board can append **every open
 PR you authored or are assigned to** (via `gh search prs --author=@me` +
 `--assignee=@me`, deduped — assigned dependabot PRs show up too), sorted by
 latest update, with `-` in the AGENT/STATUS columns and the repo in the REPO
@@ -91,10 +94,40 @@ touch ~/.local/state/herdr/plugins/martinv.pr-tracker/show-authored
 Delete the file to go back to sessions-only. Only applies in `all sessions`
 scope (`w`), and the board reads it every render — no restart needed.
 
-### `cc` — spawn a claude session for a PR
+### `cc` / `co` — spawn Claude Code or Codex for a PR
 `:10cc` checks the PR out into `$HERDR_PLUGIN_STATE_DIR/checkouts/<repo>-pr<N>`
 (reused next time), creates a **new herdr workspace**
-labeled `PR #N`, and starts claude in it.
+labeled `PR #N`, and starts Claude Code in it. `:10co` performs the same setup
+and starts Codex (`codex`) instead. Both commands can be followed by a verb:
+`:10ccar` starts Claude Code then runs `ar`; `:10cocr` starts Codex then runs
+the `cr` (code review) prompt. `:10cccocr` starts both agents, each in its
+own new Herdr workspace and dedicated worktree, and runs the same review prompt
+in both. Codex uses its `read-only` sandbox. Claude Code starts in restricted
+plan mode with only Bash and read tools enabled; MCP tools, edit tools, Git
+mutations, and GitHub CLI commands are denied. An OS-enforced sandbox also
+denies writes to its worktree and the shared Git metadata, and the launch fails
+closed if that sandbox is unavailable. The review prompt asks both agents not
+to run tests, change files, write plan files, or depend on skills/subagents; if
+those tools are unavailable, Claude performs the requested review lenses inline.
+Restricted mode requires Claude Code v2.1.248 or newer.
+Both CLIs must be installed and available on `PATH`.
+
+The pair-review defaults are Codex `gpt-6.1-sol` at **medium reasoning effort**
+and Claude Code `sonnet`. Codex review runs with the read-only sandbox and does
+not pause for command approval; commands outside the read-only boundary fail
+instead of requesting permission. The built-in review prompt avoids `gh` and
+network calls, so it can review the local checkout without requesting GitHub
+API access. Normal `co` coding sessions keep your usual Codex approval
+settings. Herdr passes these flags to the CLIs; the plugin does not set a
+global Herdr model. Codex alternatives include `gpt-5.6`; Claude
+aliases include `opus` and `haiku` (availability depends on your account).
+The first `?` help view or pair review creates `$HERDR_PLUGIN_STATE_DIR/review-models.conf`;
+edit `CODEX_MODEL`, `CODEX_REASONING_EFFORT`, and `CLAUDE_MODEL` there to select
+models and effort. The `?` help screen shows the active settings.
+
+Optional CLI flags for the normal `cc` and `co` launchers can be supplied per
+machine through `HERDR_CC_CLAUDE_ARGS` or `HERDR_COC_CODEX_ARGS` respectively.
+The pair-review launch uses its own required read-only flags.
 
 Every per-PR checkout is a **`git worktree`**, never a full clone per PR. The
 worktree hangs off your own clone if the repo is mapped in
@@ -110,10 +143,9 @@ Unmapped repos are cloned **once** into `checkouts/<repo>` and all their PR
 worktrees share that clone. Mapped repos skip the clone entirely — instant,
 offline, and your working copy is untouched. One caveat:
 git refuses a worktree for a branch that is already checked out in the source
-clone, so if you're sitting on the PR's branch there, switch away first. Combine it with any verb:
-`:10ccar` = spawn the workspace, wait for claude to boot, then type the `ar`
-template into the new session — e.g. "new workspace, claude attached to that
-PR, addressing the review".
+clone, so if you're sitting on the PR's branch there, switch away first. Combine either launcher with any verb:
+`:10ccar` = spawn the workspace, wait for Claude Code to boot, then type the `ar`
+template into the new session. Use `:10coar` for the same sequence with Codex.
 
 ### Verbs: built-in defaults + your overrides
 The plugin ships **default verbs** that work out of the box (generic prompts,
@@ -149,10 +181,11 @@ rs = @/goal CI on {url} is failing: analyze the failing checks, fix them, push, 
 ```
 
 Templates starting with **`@`** are not run locally — the text after `@` is
-typed **into the claude session that owns the PR** (via `herdr pane run`), so
-skills execute with that session's context, visibly in its pane. Sessions with
-status `working` are skipped (a half-typed prompt would corrupt their turn);
-retry when idle.
+submitted **to the coding-agent session that owns the PR** (via `herdr agent
+prompt` on current Herdr, or `herdr pane run` on older releases), so skills
+execute with that session's context. Sessions with status `working` are skipped;
+retry when idle. A newly started session receives its follow-up prompt once;
+the board does not resend it based on terminal echo, which can be unreliable.
 
 ### Triage
 `t` inspects every row's indicators and suggests one batch: conflicts/behind →
@@ -161,8 +194,9 @@ green **draft** → `pub` (publish for review — drafts are never merged),
 green + approved + `ready` → `m`, no review yet → `pr`, **waiting for your
 review** → `cr` (with a hint that `:Nfin` takes the PR over instead — triage
 never suggests rewriting a colleague's PR on its own). Merged/closed PRs are
-skipped. For rows **without a claude session**, `@` verbs are prefixed with
-`cc` (e.g. `12ccar`) so a workspace + session is spawned first. Press `Enter`
+skipped. For rows **without a session**, triage prefixes `@` verbs with `cc`
+(Claude Code), for example `12ccar`, so a workspace + session is spawned first.
+Use `co` (Codex) or `cccocr` (both read-only reviewers) directly in the command line. Press `Enter`
 to run the suggested batch, any other key to cancel (or type your own with `:`).
 
 ### Dependabot / security sweep (`d`)
@@ -180,7 +214,7 @@ Contributed-to repos without a PR on the board are listed informationally
 
 Flagged repos assemble a batch like `3dep,7dep` (one row per repo): press
 `Enter` to wrap them all up — each repo gets the `dep` verb typed into its
-claude session (spawn one first with `cc` if the row has none) — or cancel and
+coding-agent session (spawn one first with `cc` if the row has none) — or cancel and
 address a single repo with `:3dep`. Override `dep` in `commands.conf` to use
 your own skill; the built-in prompt needs none.
 
