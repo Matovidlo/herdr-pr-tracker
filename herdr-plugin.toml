@@ -1,8 +1,8 @@
 id = "martinv.pr-tracker"
-name = "Claude PR Tracker"
+name = "PR Tracker"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Tracks the GitHub PR each Claude Code session produces, with state + actions, in its own herdr window."
+description = "Tracks the GitHub PR each Claude Code or Codex session produces, with state + actions, in its own herdr window."
 platforms = ["linux", "macos"]
 
 # The PR board: a tab pane that polls agent sessions, scrapes PR URLs, and shows gh state.
@@ -16,7 +16,7 @@ command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/scripts/board.sh\""]
 [[actions]]
 id = "open-board"
 title = "Open PR board"
-description = "Open/focus the Claude PR tracker window"
+description = "Open/focus the PR tracker window"
 contexts = ["global"]
 command = ["herdr", "plugin", "pane", "open", "--plugin", "martinv.pr-tracker", "--entrypoint", "pr-board"]
 
