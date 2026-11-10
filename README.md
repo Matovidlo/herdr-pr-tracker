@@ -161,7 +161,7 @@ no personal skills required):
 | `pub`| `gh pr ready {url}` (publish draft; runs locally) |
 | `cr` | `@` conduct a code review as the requested reviewer, findings table, no auto-post |
 | `fin`| `@` take over a colleague's PR: address comments, fix CI, push until ready |
-| `dep`| `@` wrap up dependabot + security compliance for `{repo}`: merge/combine safe bumps, fix critical/high alerts, report the rest |
+| `dep`| `@` wrap up dependabot + security compliance for `{repo}`: one new PR combining all safe bumps and alert fixes (never merge the dependabot PRs one by one), report the rest |
 
 Your **personal configuration** lives in `$HERDR_PLUGIN_STATE_DIR/commands.conf`
 (e.g. `~/.local/state/herdr/plugins/martinv.pr-tracker/commands.conf`). It is
@@ -215,7 +215,7 @@ Contributed-to repos without a PR on the board are listed informationally
 Flagged repos assemble a batch like `3dep,7dep` (one row per repo): press
 `Enter` to wrap them all up — each repo gets the `dep` verb typed into its
 coding-agent session (spawn one first with `cc` if the row has none) — or cancel and
-address a single repo with `:3dep`. Override `dep` in `commands.conf` to use
+address a single repo with `:3dep`. The `dep` verb always opens one new combined PR from a fresh branch and lists the dependabot PRs and alerts it supersedes; the individual dependabot PRs are closed after it merges. Override `dep` in `commands.conf` to use
 your own skill; the built-in prompt needs none.
 
 ### Headless triage
