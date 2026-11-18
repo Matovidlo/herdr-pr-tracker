@@ -652,26 +652,32 @@ spawn_cc() {
   local -a args=()
   [ -n "${HERDR_CC_CLAUDE_ARGS:-}" ] && read -r -a args <<<"$HERDR_CC_CLAUDE_ARGS"
   if [ "${2:-}" = cr ]; then # reviews don't inherit the current session's model
-    load_review_models
-    args+=(--model "$REVIEW_CLAUDE_MODEL" --effort "$REVIEW_CLAUDE_EFFORT")
+    claude_review_args
+    args+=("${CLAUDE_REVIEW_ARGS[@]}")
   fi
   spawn_agent_session "$1" "$2" claude claude "" claude "${args[@]}"
 }
 
-# Shared read-only review profile. Single reviewers may request approval for
-# explicitly requested follow-up actions; paired reviewers stay non-interactive.
+# Single source for the Claude review model/effort (sets CLAUDE_REVIEW_ARGS).
+claude_review_args() {
+  load_review_models
+  CLAUDE_REVIEW_ARGS=(--model "$REVIEW_CLAUDE_MODEL" --effort "$REVIEW_CLAUDE_EFFORT")
+}
+
+# Shared read-only Codex review profile (sets REVIEW_ARGS). Callers append their
+# own --ask-for-approval: single reviews on-request, paired reviews never.
 codex_review_args() {
   load_review_models
   REVIEW_ARGS=(--model "$REVIEW_CODEX_MODEL" --config "model_reasoning_effort=$REVIEW_CODEX_EFFORT"
-    --sandbox read-only --ask-for-approval "${1:-never}")
+    --sandbox read-only)
 }
 
 spawn_coc() {
   local -a args=()
   [ -n "${HERDR_COC_CODEX_ARGS:-}" ] && read -r -a args <<<"$HERDR_COC_CODEX_ARGS"
   if [ "${2:-}" = cr ]; then
-    codex_review_args on-request
-    args+=("${REVIEW_ARGS[@]}")
+    codex_review_args
+    args+=("${REVIEW_ARGS[@]}" --ask-for-approval on-request)
   fi
   spawn_agent_session "$1" "$2" codex codex "" codex "${args[@]}"
 }
@@ -719,8 +725,9 @@ spawn_review_pair() {
   codex_review_dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num-review-codex"
   claude_review_dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num-review-claude"
   codex_review_args
+  claude_review_args
   printf '  row %s: starting read-only Codex (%s, %s effort) and Claude Code (%s, %s effort) reviews\n' "$n" "$REVIEW_CODEX_MODEL" "$REVIEW_CODEX_EFFORT" "$REVIEW_CLAUDE_MODEL" "$REVIEW_CLAUDE_EFFORT"
-  spawn_agent_session "$n" cr codex codex review-codex codex "${REVIEW_ARGS[@]}"
+  spawn_agent_session "$n" cr codex codex review-codex codex "${REVIEW_ARGS[@]}" --ask-for-approval never
   common_git_dir="$(git -C "$codex_review_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   if [ -z "$common_git_dir" ]; then
     printf '  row %s: cannot locate the shared Git directory; Claude review was not started\n' "$n"
@@ -729,7 +736,7 @@ spawn_review_pair() {
   claude_sandbox_settings="$(jq -cn --arg dir "$claude_review_dir" --arg gitdir "$common_git_dir" \
     '{sandbox:{enabled:true,allowUnsandboxedCommands:false,failIfUnavailable:true,filesystem:{denyWrite:[$dir,$gitdir]}}}')"
   spawn_agent_session "$n" cr claude claude review-claude claude \
-    --model "$REVIEW_CLAUDE_MODEL" --effort "$REVIEW_CLAUDE_EFFORT" --permission-mode plan --restricted \
+    "${CLAUDE_REVIEW_ARGS[@]}" --permission-mode plan --restricted \
     --tools 'Bash,Read,Glob,Grep' \
     --settings "$claude_sandbox_settings" \
     --disallowedTools Edit Write NotebookEdit 'mcp__*' \

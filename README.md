@@ -219,7 +219,7 @@ Contributed-to repos without a PR on the board are listed informationally
 Flagged repos assemble a batch like `3dep,7dep` (one row per repo): press
 `Enter` to wrap them all up — each repo gets the `dep` verb typed into its
 coding-agent session (spawn one first with `cc` if the row has none) — or cancel and
-address a single repo with `:3dep`. The `dep` verb always opens one new combined PR from a fresh branch and lists the dependabot PRs and alerts it supersedes; the individual dependabot PRs are closed after it merges. Override `dep` in `commands.conf` to use
+address a single repo with `:3dep`. The built-in `dep` opens one new combined PR (see the verb table). Override `dep` in `commands.conf` to use
 your own skill; the built-in prompt needs none.
 
 ### Headless triage
