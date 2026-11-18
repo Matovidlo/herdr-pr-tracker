@@ -651,21 +651,26 @@ spawn_agent_session() {
 spawn_cc() {
   local -a args=()
   [ -n "${HERDR_CC_CLAUDE_ARGS:-}" ] && read -r -a args <<<"$HERDR_CC_CLAUDE_ARGS"
+  if [ "${2:-}" = cr ]; then # reviews don't inherit the current session's model
+    load_review_models
+    args+=(--model "$REVIEW_CLAUDE_MODEL" --effort "$REVIEW_CLAUDE_EFFORT")
+  fi
   spawn_agent_session "$1" "$2" claude claude "" claude "${args[@]}"
 }
 
-# Single source of truth for the read-only Codex review profile (sets REVIEW_ARGS).
+# Shared read-only review profile. Single reviewers may request approval for
+# explicitly requested follow-up actions; paired reviewers stay non-interactive.
 codex_review_args() {
   load_review_models
   REVIEW_ARGS=(--model "$REVIEW_CODEX_MODEL" --config "model_reasoning_effort=$REVIEW_CODEX_EFFORT"
-    --sandbox read-only --ask-for-approval never)
+    --sandbox read-only --ask-for-approval "${1:-never}")
 }
 
 spawn_coc() {
   local -a args=()
   [ -n "${HERDR_COC_CODEX_ARGS:-}" ] && read -r -a args <<<"$HERDR_COC_CODEX_ARGS"
   if [ "${2:-}" = cr ]; then
-    codex_review_args
+    codex_review_args on-request
     args+=("${REVIEW_ARGS[@]}")
   fi
   spawn_agent_session "$1" "$2" codex codex "" codex "${args[@]}"
@@ -676,14 +681,17 @@ load_review_models() {
   [ -f "$models_file" ] || cat > "$models_file" <<'EOF'
 # Model IDs or aliases supported by your installed agent CLIs.
 # Edit these per machine; the interactive agents can also change models later.
-# Codex examples: gpt-6.1-sol, gpt-5.6. Claude aliases: sonnet, opus, haiku.
+# Codex examples: gpt-6.1-sol, gpt-5.6. Claude: full IDs or aliases (sonnet, opus, haiku);
+# CLAUDE_EFFORT is low|medium|high|xhigh|max.
 CODEX_MODEL=gpt-6.1-sol
 CODEX_REASONING_EFFORT=medium
-CLAUDE_MODEL=sonnet
+CLAUDE_MODEL=claude-sonnet-5-5
+CLAUDE_EFFORT=medium
 EOF
   REVIEW_CODEX_MODEL="gpt-6.1-sol"
   REVIEW_CODEX_EFFORT="medium"
-  REVIEW_CLAUDE_MODEL="sonnet"
+  REVIEW_CLAUDE_MODEL="claude-sonnet-5-5"
+  REVIEW_CLAUDE_EFFORT="medium"
   while IFS='=' read -r key value; do
     key="${key//[[:space:]]/}"
     value="${value#"${value%%[![:space:]]*}"}"
@@ -692,6 +700,7 @@ EOF
       CODEX_MODEL) [ -n "$value" ] && REVIEW_CODEX_MODEL="$value" ;;
       CODEX_REASONING_EFFORT) [ -n "$value" ] && REVIEW_CODEX_EFFORT="$value" ;;
       CLAUDE_MODEL) [ -n "$value" ] && REVIEW_CLAUDE_MODEL="$value" ;;
+      CLAUDE_EFFORT) [ -n "$value" ] && REVIEW_CLAUDE_EFFORT="$value" ;;
     esac
   done < <(grep -v '^[[:space:]]*#' "$models_file" 2>/dev/null)
 }
@@ -710,7 +719,7 @@ spawn_review_pair() {
   codex_review_dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num-review-codex"
   claude_review_dir="$STATE_DIR/checkouts/${repo//\//_}-pr$num-review-claude"
   codex_review_args
-  printf '  row %s: starting read-only Codex (%s, %s effort) and Claude Code (%s) reviews\n' "$n" "$REVIEW_CODEX_MODEL" "$REVIEW_CODEX_EFFORT" "$REVIEW_CLAUDE_MODEL"
+  printf '  row %s: starting read-only Codex (%s, %s effort) and Claude Code (%s, %s effort) reviews\n' "$n" "$REVIEW_CODEX_MODEL" "$REVIEW_CODEX_EFFORT" "$REVIEW_CLAUDE_MODEL" "$REVIEW_CLAUDE_EFFORT"
   spawn_agent_session "$n" cr codex codex review-codex codex "${REVIEW_ARGS[@]}"
   common_git_dir="$(git -C "$codex_review_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   if [ -z "$common_git_dir" ]; then
@@ -720,7 +729,7 @@ spawn_review_pair() {
   claude_sandbox_settings="$(jq -cn --arg dir "$claude_review_dir" --arg gitdir "$common_git_dir" \
     '{sandbox:{enabled:true,allowUnsandboxedCommands:false,failIfUnavailable:true,filesystem:{denyWrite:[$dir,$gitdir]}}}')"
   spawn_agent_session "$n" cr claude claude review-claude claude \
-    --model "$REVIEW_CLAUDE_MODEL" --permission-mode plan --restricted \
+    --model "$REVIEW_CLAUDE_MODEL" --effort "$REVIEW_CLAUDE_EFFORT" --permission-mode plan --restricted \
     --tools 'Bash,Read,Glob,Grep' \
     --settings "$claude_sandbox_settings" \
     --disallowedTools Edit Write NotebookEdit 'mcp__*' \
@@ -744,9 +753,9 @@ declare -A DEFAULT_CMDS=(
   [rs]='@CI on PR {url} is failing: analyze the failing checks, fix them, push, and repeat until every check is green.'
   [s]='@/simplify'
   [pub]='gh pr ready {url}'
-  [cr]='@Conduct a read-only code review of PR {url} as the requested reviewer: use only the checked-out branch and local git data. Do not run gh, access the network, run tests, change files, write a plan/scratch file, submit the review to GitHub, or depend on skills/subagents. If a requested skill or agent tool is unavailable, perform its review lens inline and label it accordingly. Study the full diff and existing tests, assess correctness, test coverage, and maintainability, rank findings by severity with exact file:line, and present a findings table.'
+  [cr]='@Conduct a read-only code review of PR {url} as the requested reviewer: for the initial review, use only the checked-out branch and local git data. During that review, do not run gh, access the network, run tests, change files, write a plan/scratch file, submit the review to GitHub, or depend on skills/subagents. If a requested skill or agent tool is unavailable, perform its review lens inline and label it accordingly. Study the full diff and existing tests, assess correctness, test coverage, and maintainability, rank findings by severity with exact file:line, and present a findings table. Do not post automatically. If I later explicitly ask you to approve/comment/post, use gh to submit the requested review and return its URL and state; request command approval if required by the sandbox. A read-only sandbox or missing Edit/Write tools alone does not prohibit requesting command approval. If the runtime forbids escalation, explain that restriction and provide the exact posting command.'
   [fin]='@Take over PR {url} and finish it: read the discussion and unresolved review comments, address them, fix any failing CI, rebase on the base branch if needed, and push until the PR is green and ready to merge.'
-  [dep]='@Wrap up dependabot and security compliance for {repo}: list all open dependabot PRs and open dependabot alerts (critical/high first), merge or combine the safe bumps, fix what the alerts require, and report anything that needs manual attention.'
+  [dep]='@Wrap up dependabot and security compliance for {repo}: list all open dependabot PRs and open dependabot alerts (critical/high first). Always create ONE new PR from a fresh branch off the base branch that addresses all of them together: apply every safe bump from the open dependabot PRs and every fix the alerts require (the patched version, no unneeded major jumps), relock, run the tests and lint for the touched code, and list the dependabot PRs and alerts it supersedes in the PR body. Do not merge the individual dependabot PRs; close them after the combined PR merges. Report anything that needs manual attention: alerts with no patched version, major bumps, and bumps whose checks fail.'
 )
 load_cmds() {
   CMDS=()
@@ -782,7 +791,7 @@ show_help() {
   printf '\n%s  keys%s      <n>+Enter open in browser · c/m/p/x/v then <n>+Enter checkout/merge/plan/discard/review-detail · : batch · t triage · d dependabot/security sweep · r refresh · u undiscard all · w scope · q quit\n' "$C_BLD" "$C_RST"
   printf '%s  batch%s     :<row><verb>[,<row><verb>…]  e.g. ":1pr,2m,3r,4ar" — no verb = open, so ":1,2" opens two tabs\n' "$C_BLD" "$C_RST"
   printf '%s  built-in%s  o open · c checkout · m merge · p plan · x discard · v review detail · cc Claude Code · co Codex · cccocr read-only review in both (separate worktrees)\n' "$C_BLD" "$C_RST"
-  printf '%s  review models%s Codex=%s (%s effort) · Claude Code=%s (edit %s/review-models.conf)\n' "$C_BLD" "$C_RST" "$REVIEW_CODEX_MODEL" "$REVIEW_CODEX_EFFORT" "$REVIEW_CLAUDE_MODEL" "$STATE_DIR"
+  printf '%s  review models%s Codex=%s (%s effort) · Claude Code=%s (%s effort) (edit %s/review-models.conf)\n' "$C_BLD" "$C_RST" "$REVIEW_CODEX_MODEL" "$REVIEW_CODEX_EFFORT" "$REVIEW_CLAUDE_MODEL" "$REVIEW_CLAUDE_EFFORT" "$STATE_DIR"
   printf '%s  columns%s   REVIEW → single pending reviewer by name, or approved/total when several are involved · RTM = ready to merge right now (mergeable, checks green, not blocked on review)\n' "$C_BLD" "$C_RST"
   printf '%s  verbs%s     '"'"'@'"'"' = typed into the PR'"'"'s coding-agent session · override defaults in %s:\n' "$C_BLD" "$C_RST" "$CMDS_FILE"
   local v tag

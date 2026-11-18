@@ -66,7 +66,8 @@ reviewer name in REVIEW show whose PR it is and who it waits on. Two verbs targe
 - `cr` — **conduct the code review** (the usual case): findings table with
   file:line, ranked by severity. The built-in prompt uses the checked-out
   branch and local Git data only; it does not call `gh` or access the network.
-  Findings are never posted to GitHub.
+  Findings are not posted automatically. In a single Codex review session,
+  ask the agent to approve/comment/post to submit the review afterward.
 - `fin` — **take the PR over** when the author is away: address the open
   review comments, fix CI, rebase, push until it's ready to merge.
 
@@ -112,17 +113,20 @@ those tools are unavailable, Claude performs the requested review lenses inline.
 Restricted mode requires Claude Code v2.1.248 or newer.
 Both CLIs must be installed and available on `PATH`.
 
-The pair-review defaults are Codex `gpt-6.1-sol` at **medium reasoning effort**
-and Claude Code `sonnet`. Codex review runs with the read-only sandbox and does
-not pause for command approval; commands outside the read-only boundary fail
-instead of requesting permission. The built-in review prompt avoids `gh` and
-network calls, so it can review the local checkout without requesting GitHub
-API access. Normal `co` coding sessions keep your usual Codex approval
+The review defaults are Codex `gpt-6.1-sol` at **medium reasoning effort**
+and Claude Code `claude-sonnet-5-5` at **medium effort** (`cccr` and `cccocr` pass
+`--model`/`--effort`, so reviews never inherit your current session model). Single Codex reviews (`cocr`) use the read-only
+sandbox with `on-request` approvals, so a later explicit approve/comment/post
+instruction can submit the review through `gh`, requesting command approval
+when needed. The initial review stays local and does not post automatically.
+Paired reviews (`cccocr`) disable Codex command approvals; commands outside
+the read-only boundary fail instead of requesting permission, and those panes
+cannot post reviews. Normal `co` coding sessions keep your usual Codex approval
 settings. Herdr passes these flags to the CLIs; the plugin does not set a
 global Herdr model. Codex alternatives include `gpt-5.6`; Claude
 aliases include `opus` and `haiku` (availability depends on your account).
 The first `?` help view or pair review creates `$HERDR_PLUGIN_STATE_DIR/review-models.conf`;
-edit `CODEX_MODEL`, `CODEX_REASONING_EFFORT`, and `CLAUDE_MODEL` there to select
+edit `CODEX_MODEL`, `CODEX_REASONING_EFFORT`, `CLAUDE_MODEL`, and `CLAUDE_EFFORT` there to select
 models and effort. The `?` help screen shows the active settings.
 
 Optional CLI flags for the normal `cc` and `co` launchers can be supplied per
@@ -161,7 +165,7 @@ no personal skills required):
 | `pub`| `gh pr ready {url}` (publish draft; runs locally) |
 | `cr` | `@` conduct a code review as the requested reviewer, findings table, no auto-post |
 | `fin`| `@` take over a colleague's PR: address comments, fix CI, push until ready |
-| `dep`| `@` wrap up dependabot + security compliance for `{repo}`: merge/combine safe bumps, fix critical/high alerts, report the rest |
+| `dep`| `@` wrap up dependabot + security compliance for `{repo}`: one new PR combining all safe bumps and alert fixes (never merge the dependabot PRs one by one), report the rest |
 
 Your **personal configuration** lives in `$HERDR_PLUGIN_STATE_DIR/commands.conf`
 (e.g. `~/.local/state/herdr/plugins/martinv.pr-tracker/commands.conf`). It is
@@ -215,7 +219,7 @@ Contributed-to repos without a PR on the board are listed informationally
 Flagged repos assemble a batch like `3dep,7dep` (one row per repo): press
 `Enter` to wrap them all up — each repo gets the `dep` verb typed into its
 coding-agent session (spawn one first with `cc` if the row has none) — or cancel and
-address a single repo with `:3dep`. Override `dep` in `commands.conf` to use
+address a single repo with `:3dep`. The `dep` verb always opens one new combined PR from a fresh branch and lists the dependabot PRs and alerts it supersedes; the individual dependabot PRs are closed after it merges. Override `dep` in `commands.conf` to use
 your own skill; the built-in prompt needs none.
 
 ### Headless triage
